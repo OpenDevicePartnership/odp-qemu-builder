@@ -1,8 +1,5 @@
 FROM ubuntu:24.04
 
-ARG QEMU_URL="https://gitlab.com/qemu-project/qemu.git"
-ARG QEMU_BRANCH="v10.0.0"
-
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         bash \
@@ -10,6 +7,7 @@ RUN apt-get update && \
         bison \
         bzip2 \
         ca-certificates \
+        ccache \
         findutils \
         flex \
         gcc \
@@ -27,13 +25,18 @@ RUN apt-get update && \
         python3 \
         python3-venv \
         sed \
-        tar \
-        git && \
+        tar && \
+    rm -rf /var/lib/apt/lists/*
+
+ARG QEMU_URL="https://gitlab.com/qemu-project/qemu.git"
+ARG QEMU_BRANCH="v10.0.0"
+ARG TARGETARCH
+
+RUN --mount=type=cache,id=ccache-${TARGETARCH},target=/root/.cache/ccache \
     git clone "${QEMU_URL}" --branch "${QEMU_BRANCH}" --depth 1 qemu && \
     cd qemu && \
-    ./configure --target-list=aarch64-softmmu && \
-    ninja -C build qemu-system-aarch64 && \
+    PATH="/usr/lib/ccache:${PATH}" ./configure --target-list=aarch64-softmmu && \
+    PATH="/usr/lib/ccache:${PATH}" ninja -C build qemu-system-aarch64 && \
     ninja -C build install && \
     cd .. && \
-    rm -rf qemu && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf qemu
