@@ -1,45 +1,49 @@
 # qemu-builder
 
-Prebuilt QEMU binaries for Ubuntu 24.04, distributed as a Docker image for `amd64` and `arm64`.
-
-The image compiles `qemu-system-aarch64` from source against the Ubuntu 24.04 system libraries, so the resulting binary is native to the host platform and doesn't require any additional runtime dependencies beyond what's already in the image.
+Prebuilt QEMU `aarch64` binaries for Ubuntu 24.04, published as a multi-arch Docker image (`amd64` / `arm64`) with TPM support enabled.
 
 ## Usage
 
-Pull the image from the GitHub Container Registry:
+Pull the image:
 
 ```bash
-docker pull ghcr.io/dymk/qemu-builder:latest
+docker pull ghcr.io/opendevicepartnership/odp-qemu-builder/qemu:latest
 ```
 
-Run `qemu-system-aarch64` directly:
+Run QEMU directly:
 
 ```bash
-docker run --rm ghcr.io/dymk/qemu-builder:latest qemu-system-aarch64 --version
+docker run --rm ghcr.io/opendevicepartnership/odp-qemu-builder/qemu:latest qemu-system-aarch64 --version
 ```
 
-Or copy the binary out of the image into your own build:
+Copy the binary into your own image:
 
 ```dockerfile
-COPY --from=ghcr.io/dymk/qemu-builder:latest /usr/local/bin/qemu-system-aarch64 /usr/local/bin/
+COPY --from=ghcr.io/opendevicepartnership/odp-qemu-builder/qemu:latest /usr/local/bin/qemu-system-aarch64 /usr/local/bin/
 ```
 
-## Build
+## Building
 
-The image is built automatically via GitHub Actions on every push to `main` and published to `ghcr.io/dymk/qemu-builder`. Builds target both `linux/amd64` and `linux/arm64`.
+### CI
 
-To build locally:
+A GitHub Actions workflow builds and pushes on every commit to `main`. Images are published to `ghcr.io/opendevicepartnership/odp-qemu-builder/qemu`.
+
+### Local
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 -t qemu-builder .
+./build-local.sh
 ```
+
+This will create a dedicated `buildx` builder, compile for `linux/amd64` and `linux/arm64`, and push to GHCR. A local layer cache under `~/.cache/docker-buildx/` is used to speed up repeated builds.
 
 ## Configuration
 
-The QEMU source and version can be overridden at build time via build args:
+| Build Arg      | Default                                    | Description             |
+|----------------|--------------------------------------------|-------------------------|
+| `QEMU_URL`     | `https://gitlab.com/qemu-project/qemu.git` | Git repository to clone |
+| `QEMU_BRANCH`  | `v10.0.0`                                  | Branch or tag to build  |
 
-| Arg           | Default                                      | Description              |
-|---------------|----------------------------------------------|--------------------------|
-| `QEMU_URL`    | `https://gitlab.com/qemu-project/qemu.git`   | Git repository to clone  |
-| `QEMU_BRANCH` | `v10.0.0`                                    | Branch or tag to build   |
+## License
+
+See [LICENSE](LICENSE).
 
