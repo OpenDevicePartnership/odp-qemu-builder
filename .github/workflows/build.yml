@@ -56,5 +56,5 @@ jobs:
             BUILDKIT_INLINE_CACHE=1
           cache-from: |
             type=gha
-            type=registry,ref=ghcr.io/dymk/qemu-builder:latest
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           cache-to: type=gha,mode=max
