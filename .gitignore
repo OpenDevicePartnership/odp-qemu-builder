@@ -1,0 +1,5 @@
+# Local build cache (created by ./build.sh)
+.cache/
+
+# Docker
+*.tar.gz
