@@ -1,5 +1,5 @@
 # Builder image: build tools + amd64/arm64 cross-compilation libraries.
-# Does NOT compile QEMU itself — use build.sh with volume mounts for that.
+# Does NOT compile QEMU itself — use build-in-docker.sh with volume mounts.
 FROM ubuntu:24.04
 
 # --------------------------------------------------------------------------
@@ -44,8 +44,8 @@ RUN apt-get update && \
 # --------------------------------------------------------------------------
 # Copy build script and patch into the image
 # --------------------------------------------------------------------------
-COPY build.sh /opt/builder/build.sh
+COPY build-in-docker.sh /opt/builder/build-in-docker.sh
 COPY qemu-sbsa-patch.patch /opt/builder/qemu-sbsa-patch.patch
-RUN chmod +x /opt/builder/build.sh
+RUN chmod +x /opt/builder/build-in-docker.sh
 
 WORKDIR /work

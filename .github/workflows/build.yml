@@ -108,7 +108,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build-${{ matrix.arch }}
-          key: build-${{ matrix.arch }}-${{ env.QEMU_BRANCH }}-${{ hashFiles('Dockerfile', 'build.sh') }}
+          key: build-${{ matrix.arch }}-${{ env.QEMU_BRANCH }}-${{ hashFiles('Dockerfile', 'build-in-docker.sh') }}
 
       - name: Restore ccache cache
         uses: actions/cache@v4
@@ -127,7 +127,7 @@ jobs:
             -v "${{ github.workspace }}/ccache-${{ matrix.arch }}:/work/ccache" \
             -v "${{ github.workspace }}/output:/work/output" \
             "${{ needs.build-builder-image.outputs.image }}" \
-            /opt/builder/build.sh "${{ matrix.arch }}"
+            /opt/builder/build-in-docker.sh "${{ matrix.arch }}"
 
       - name: Create tarball
         run: |
