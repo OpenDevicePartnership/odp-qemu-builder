@@ -61,15 +61,6 @@ jobs:
             type=gha,scope=builder
             type=registry,ref=${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE }}:latest
           cache-to: type=gha,scope=builder,mode=max
-
-      # Export as a tarball so the build-qemu job can load it regardless of
-      # whether we pushed (the GHA cache means this is near-instant).
-      - name: Export builder image tarball
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha,scope=builder
           outputs: type=docker,dest=/tmp/builder-image.tar
 
       - name: Upload builder image
@@ -97,13 +88,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download builder image
         uses: actions/download-artifact@v4

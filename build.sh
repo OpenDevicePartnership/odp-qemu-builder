@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh — Build qemu-system-aarch64 inside the builder container.
+# build.sh — Build QEMU inside the builder container.
 #
 # Usage:  build.sh <ARCH>
 #   ARCH:  amd64  — native build
@@ -9,7 +9,7 @@
 #   /work/qemu    — QEMU source tree (cloned here if empty)
 #   /work/build   — out-of-source build directory
 #   /work/ccache  — ccache cache directory
-#   /work/output  — the built binary is copied here
+#   /work/output  — installed QEMU tree (via DESTDIR)
 #
 # Environment variables (optional):
 #   QEMU_URL     — git remote  (default: https://gitlab.com/qemu-project/qemu.git)
