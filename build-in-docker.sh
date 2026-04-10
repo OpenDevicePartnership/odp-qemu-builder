@@ -81,6 +81,6 @@ DESTDIR=/work/output ninja install
 
 echo "==> Build complete"
 echo "    contents:"
-find /work/output -type f | head -50
+find /work/output -type f | head -50 || true
 echo "    ccache stats:"
 ccache --show-stats
