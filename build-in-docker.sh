@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build-in-docker.sh — Build QEMU inside the builder container.
 #
-# Usage:  build.sh <ARCH>
+# Usage:  build-in-docker.sh <ARCH>
 #   ARCH:  amd64  — native build
 #          arm64  — cross-compile with aarch64-linux-gnu toolchain
 #
@@ -16,7 +16,7 @@
 #   QEMU_BRANCH  — git branch/tag to check out (default: v10.0.0)
 set -euo pipefail
 
-ARCH="${1:?Usage: build.sh <amd64|arm64>}"
+ARCH="${1:?Usage: build-in-docker.sh <amd64|arm64>}"
 QEMU_URL="${QEMU_URL:-https://gitlab.com/qemu-project/qemu.git}"
 QEMU_BRANCH="${QEMU_BRANCH:-v10.0.0}"
 
@@ -27,6 +27,11 @@ mkdir -p "$CCACHE_DIR"
 
 # ----- Clone QEMU source if not already present ----------------------------
 if [ ! -d /work/qemu/.git ]; then
+    if [ -d /work/qemu ] && find /work/qemu -mindepth 1 -maxdepth 1 | read -r; then
+        echo "error: /work/qemu exists and is not empty, but is not a git checkout" >&2
+        echo "       remove/clean /work/qemu or mount an empty directory before cloning" >&2
+        exit 1
+    fi
     echo "==> Cloning QEMU ${QEMU_BRANCH} from ${QEMU_URL}"
     git clone "${QEMU_URL}" --branch "${QEMU_BRANCH}" --depth 1 /work/qemu
     echo "==> Applying sbsa patch"
@@ -76,6 +81,9 @@ echo "==> Building QEMU (ARCH=${ARCH})"
 ninja
 
 # ----- Install into output --------------------------------------------------
+echo "==> Cleaning previous install from /work/output/usr/local"
+rm -rf /work/output/usr/local
+mkdir -p /work/output/usr/local
 echo "==> Installing QEMU to /work/output"
 DESTDIR=/work/output ninja install
 

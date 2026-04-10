@@ -45,9 +45,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .cache/ccache-${{ matrix.arch }}
-          key: ccache-${{ matrix.arch }}-${{ github.sha }}
+          key: ccache-${{ matrix.arch }}-${{ env.QEMU_BRANCH }}-${{ hashFiles('Dockerfile', 'build-in-docker.sh', 'qemu-sbsa-patch.patch') }}
           restore-keys: |
-            ccache-${{ matrix.arch }}-
+            ccache-${{ matrix.arch }}-${{ env.QEMU_BRANCH }}-
 
       - name: Build QEMU (${{ matrix.arch }})
         run: ./build.sh ${{ matrix.arch }}
