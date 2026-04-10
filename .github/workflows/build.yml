@@ -1,30 +1,38 @@
-name: Build and Push Docker Image
+name: Build QEMU
 
 on:
   push:
     branches:
       - main
+  pull_request:
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/qemu
+  BUILDER_IMAGE: ${{ github.repository }}/builder
+  QEMU_BRANCH: "v10.0.0"
 
+permissions:
+  contents: read
+  packages: write
+
+# ---------------------------------------------------------------------------
+# Job 1: Build (and optionally push) the builder Docker image
+# ---------------------------------------------------------------------------
 jobs:
-  build-and-push:
+  build-builder-image:
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
-
+    outputs:
+      image: ${{ steps.image-ref.outputs.image }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
+      - name: Set up QEMU (binfmt)
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
+        id: setup-buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
@@ -34,27 +42,116 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
+      - name: Builder image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE }}
           tags: |
-            type=ref,event=branch
-            type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest
 
-      - name: Build and push
+      - name: Build builder image
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
           cache-from: |
-            type=gha
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          cache-to: type=gha,mode=max
+            type=gha,scope=builder
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE }}:latest
+          cache-to: type=gha,scope=builder,mode=max
+
+      # Export as a tarball so the build-qemu job can load it regardless of
+      # whether we pushed (the GHA cache means this is near-instant).
+      - name: Export builder image tarball
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=builder
+          outputs: type=docker,dest=/tmp/builder-image.tar
+
+      - name: Upload builder image
+        uses: actions/upload-artifact@v4
+        with:
+          name: builder-image
+          path: /tmp/builder-image.tar
+          retention-days: 1
+
+      - name: Compute image ref for downstream jobs
+        id: image-ref
+        run: |
+          # Use the first tag from metadata (there's only one: latest)
+          echo "image=$(echo '${{ steps.meta.outputs.tags }}' | head -n1)" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Build QEMU for each architecture using the builder image
+  # ---------------------------------------------------------------------------
+  build-qemu:
+    needs: build-builder-image
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download builder image
+        uses: actions/download-artifact@v4
+        with:
+          name: builder-image
+          path: /tmp
+
+      - name: Load builder image
+        run: docker load -i /tmp/builder-image.tar
+
+      - name: Restore QEMU source cache
+        uses: actions/cache@v4
+        with:
+          path: qemu-src
+          key: qemu-src-${{ env.QEMU_BRANCH }}-${{ hashFiles('qemu-sbsa-patch.patch') }}
+
+      - name: Restore build cache
+        uses: actions/cache@v4
+        with:
+          path: build-${{ matrix.arch }}
+          key: build-${{ matrix.arch }}-${{ env.QEMU_BRANCH }}-${{ hashFiles('Dockerfile', 'build.sh') }}
+
+      - name: Restore ccache cache
+        uses: actions/cache@v4
+        with:
+          path: ccache-${{ matrix.arch }}
+          key: ccache-${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.arch }}-
+
+      - name: Build QEMU (${{ matrix.arch }})
+        run: |
+          mkdir -p qemu-src build-${{ matrix.arch }} ccache-${{ matrix.arch }} output
+          docker run --rm \
+            -v "${{ github.workspace }}/qemu-src:/work/qemu" \
+            -v "${{ github.workspace }}/build-${{ matrix.arch }}:/work/build" \
+            -v "${{ github.workspace }}/ccache-${{ matrix.arch }}:/work/ccache" \
+            -v "${{ github.workspace }}/output:/work/output" \
+            "${{ needs.build-builder-image.outputs.image }}" \
+            /opt/builder/build.sh "${{ matrix.arch }}"
+
+      - name: Create tarball
+        run: |
+          tar czf "qemu-${{ matrix.arch }}.tar.gz" \
+            -C output/usr/local .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-${{ matrix.arch }}
+          path: qemu-${{ matrix.arch }}.tar.gz
