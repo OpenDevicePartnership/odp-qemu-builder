@@ -11,7 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILDER_IMAGE="qemu-builder:local"
-CACHE_DIR="${HOME}/.cache/qemu-builder"
+CACHE_DIR="${SCRIPT_DIR}/.cache"
 ARCHS=("${@:-amd64 arm64}")
 
 # ---------------------------------------------------------------------------

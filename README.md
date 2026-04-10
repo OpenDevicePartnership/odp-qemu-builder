@@ -23,10 +23,10 @@ docker pull ghcr.io/opendevicepartnership/odp-qemu-builder/builder:latest
 ```
 
 This builds the builder Docker image, then runs it with local cache directories
-under `~/.cache/qemu-builder/`. Subsequent builds reuse cached QEMU sources,
+under `.cache/` in the repo directory. Subsequent builds reuse cached QEMU sources,
 build objects, and ccache data for fast incremental rebuilds.
 
-Output artifacts are placed in `~/.cache/qemu-builder/output-<arch>/usr/local/`.
+Output artifacts are placed in `.cache/output-<arch>/usr/local/`.
 
 ### Prerequisites
 
