@@ -22,11 +22,14 @@ Copy the binary into your own image:
 COPY --from=ghcr.io/opendevicepartnership/odp-qemu-builder/qemu:latest /usr/local/bin/qemu-system-aarch64 /usr/local/bin/
 ```
 
-Or copy the riscv32 binary:
+Or copy the riscv32 binary. RISC-V guests typically need OpenSBI as the boot firmware (loaded by QEMU via `-bios`), so copy the firmware blob alongside the binary:
 
 ```dockerfile
 COPY --from=ghcr.io/opendevicepartnership/odp-qemu-builder/qemu:latest /usr/local/bin/qemu-system-riscv32 /usr/local/bin/
+COPY --from=ghcr.io/opendevicepartnership/odp-qemu-builder/qemu:latest /usr/local/share/qemu/opensbi-riscv32-generic-fw_dynamic.bin /usr/local/share/qemu/
 ```
+
+Skip the firmware copy if your downstream image uses `-bios none` or supplies its own firmware.
 
 ## Building
 

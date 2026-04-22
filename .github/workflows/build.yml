@@ -19,6 +19,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      actions: write
     strategy:
       fail-fast: true
       matrix:
@@ -37,6 +38,14 @@ jobs:
         id: ptag
         run: echo "tag=$(echo '${{ matrix.platform }}' | sed 's|/|-|g')" >> "$GITHUB_OUTPUT"
 
+      - name: Compute expected QEMU version (from Dockerfile)
+        id: qver
+        run: |
+          v=$(grep -oP '^ARG QEMU_BRANCH="v\K[^"]+' Dockerfile)
+          if [ -z "$v" ]; then echo "Could not parse QEMU_BRANCH from Dockerfile" >&2; exit 1; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Expected QEMU version: $v"
+
       - name: Build (load locally, single platform)
         uses: docker/build-push-action@v6
         with:
@@ -51,23 +60,23 @@ jobs:
         run: |
           docker run --rm --platform=${{ matrix.platform }} \
             local/qemu-builder:${{ steps.ptag.outputs.tag }} \
-            qemu-system-aarch64 --version | tee /dev/stderr | grep -q '10\.0\.0'
+            qemu-system-aarch64 --version | tee /dev/stderr | grep -qF '${{ steps.qver.outputs.version }}'
 
       - name: Smoke test — qemu-system-riscv32 --version
         run: |
           docker run --rm --platform=${{ matrix.platform }} \
             local/qemu-builder:${{ steps.ptag.outputs.tag }} \
-            qemu-system-riscv32 --version | tee /dev/stderr | grep -q '10\.0\.0'
+            qemu-system-riscv32 --version | tee /dev/stderr | grep -qF '${{ steps.qver.outputs.version }}'
 
-      - name: IMG-03 — riscv32 firmware blob present (amd64 only)
-        if: matrix.platform == 'linux/amd64'
+      - name: IMG-03 — riscv32 firmware blob present
         run: |
-          docker run --rm local/qemu-builder:${{ steps.ptag.outputs.tag }} \
+          docker run --rm --platform=${{ matrix.platform }} \
+            local/qemu-builder:${{ steps.ptag.outputs.tag }} \
             ls -l /usr/local/share/qemu/opensbi-riscv32-generic-fw_dynamic.bin
 
       - name: Summary
         run: |
-          echo "::notice::Smoke tests passed for ${{ matrix.platform }} — qemu-system-aarch64 + qemu-system-riscv32 v10.0.0"
+          echo "::notice::Smoke tests passed for ${{ matrix.platform }} — qemu-system-aarch64 + qemu-system-riscv32 v${{ steps.qver.outputs.version }}"
 
   push:
     needs: build-and-test
@@ -76,6 +85,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      actions: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -103,7 +113,7 @@ jobs:
             type=sha,prefix=sha-
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push (multi-arch, cache-only)
+      - name: Build and push (multi-arch)
         uses: docker/build-push-action@v6
         with:
           context: .
