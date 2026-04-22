@@ -1,6 +1,6 @@
 # qemu-builder
 
-Prebuilt QEMU `aarch64` binaries for Ubuntu 24.04, published as a multi-arch Docker image (`amd64` / `arm64`) with TPM support enabled.
+Prebuilt QEMU `aarch64` and `riscv32` binaries for Ubuntu 24.04, published as a multi-arch Docker image (`amd64` / `arm64`) with TPM support enabled.
 
 ## Usage
 
@@ -20,6 +20,12 @@ Copy the binary into your own image:
 
 ```dockerfile
 COPY --from=ghcr.io/opendevicepartnership/odp-qemu-builder/qemu:latest /usr/local/bin/qemu-system-aarch64 /usr/local/bin/
+```
+
+Or copy the riscv32 binary:
+
+```dockerfile
+COPY --from=ghcr.io/opendevicepartnership/odp-qemu-builder/qemu:latest /usr/local/bin/qemu-system-riscv32 /usr/local/bin/
 ```
 
 ## Building
