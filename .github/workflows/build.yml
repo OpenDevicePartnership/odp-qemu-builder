@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 env:
@@ -11,12 +14,78 @@ env:
   IMAGE_NAME: ${{ github.repository }}/qemu
 
 jobs:
-  build-and-push:
+  build-and-test:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
+      actions: write
+    strategy:
+      fail-fast: true
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
+      - name: Set up QEMU (binfmt for cross-platform docker run)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute platform tag
+        id: ptag
+        run: echo "tag=$(echo '${{ matrix.platform }}' | sed 's|/|-|g')" >> "$GITHUB_OUTPUT"
+
+      - name: Compute expected QEMU version (from Dockerfile)
+        id: qver
+        run: |
+          v=$(grep -oP '^ARG QEMU_BRANCH="v\K[^"]+' Dockerfile)
+          if [ -z "$v" ]; then echo "Could not parse QEMU_BRANCH from Dockerfile" >&2; exit 1; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Expected QEMU version: $v"
+
+      - name: Build (load locally, single platform)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: local/qemu-builder:${{ steps.ptag.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test — qemu-system-aarch64 --version
+        run: |
+          docker run --rm --platform=${{ matrix.platform }} \
+            local/qemu-builder:${{ steps.ptag.outputs.tag }} \
+            qemu-system-aarch64 --version | tee /dev/stderr | grep -qF '${{ steps.qver.outputs.version }}'
+
+      - name: Smoke test — qemu-system-riscv32 --version
+        run: |
+          docker run --rm --platform=${{ matrix.platform }} \
+            local/qemu-builder:${{ steps.ptag.outputs.tag }} \
+            qemu-system-riscv32 --version | tee /dev/stderr | grep -qF '${{ steps.qver.outputs.version }}'
+
+      - name: IMG-03 — riscv32 firmware blob present
+        run: |
+          docker run --rm --platform=${{ matrix.platform }} \
+            local/qemu-builder:${{ steps.ptag.outputs.tag }} \
+            ls -l /usr/local/share/qemu/opensbi-riscv32-generic-fw_dynamic.bin
+
+      - name: Summary
+        run: |
+          echo "::notice::Smoke tests passed for ${{ matrix.platform }} — qemu-system-aarch64 + qemu-system-riscv32 v${{ steps.qver.outputs.version }}"
+
+  push:
+    needs: build-and-test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      actions: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,7 +113,7 @@ jobs:
             type=sha,prefix=sha-
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push
+      - name: Build and push (multi-arch)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -52,9 +121,5 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
-          cache-from: |
-            type=gha
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
           cache-to: type=gha,mode=max
