@@ -16,6 +16,7 @@ RUN apt-get update && \
         libfdt-dev \
         libffi-dev \
         libglib2.0-dev \
+        libgtk-3-dev \
         libpixman-1-dev \
         locales \
         make \
@@ -41,7 +42,7 @@ RUN --mount=type=cache,id=ccache-${TARGETARCH},target=/root/.cache/ccache \
     cd qemu && \
     git apply /tmp/qemu-sbsa-patch.patch && \
     git apply /tmp/qemu-bus-emulation.patch && \
-    PATH="/usr/lib/ccache:${PATH}" ./configure --target-list=aarch64-softmmu,riscv32-softmmu --enable-plugins --enable-tpm && \
+    PATH="/usr/lib/ccache:${PATH}" ./configure --target-list=aarch64-softmmu,riscv32-softmmu --enable-plugins --enable-tpm --enable-gtk --enable-modules --prefix=/usr/local --libdir=/usr/local/lib && \
     PATH="/usr/lib/ccache:${PATH}" ninja -C build qemu-system-aarch64 qemu-system-riscv32 && \
     ninja -C build install && \
     cd .. && \

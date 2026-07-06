@@ -31,6 +31,21 @@ COPY --from=ghcr.io/opendevicepartnership/odp-qemu-builder/qemu:latest /usr/loca
 
 Skip the firmware copy if your downstream image uses `-bios none` or supplies its own firmware.
 
+### GTK display
+
+QEMU is built with `--enable-modules`, so GTK display support ships as a loadable module (`ui-gtk.so`) rather than being linked into the binary. Headless usage (e.g. `-display none`, VNC) needs no GTK libraries at all.
+
+To use `-display gtk` in a downstream image, copy the module directory and install the GTK runtime library:
+
+```dockerfile
+COPY --from=ghcr.io/opendevicepartnership/odp-qemu-builder/qemu:latest /usr/local/lib/qemu/ /usr/local/lib/qemu/
+RUN apt-get update && apt-get install -y --no-install-recommends libgtk-3-0t64 && rm -rf /var/lib/apt/lists/*
+```
+
+`libgtk-3-0t64` is the only package you need to install — apt pulls in the rest of the GTK stack automatically. (That is the Ubuntu 24.04 package name; other distros/releases may call it differently, e.g. `libgtk-3-0`.)
+
+QEMU loads `ui-gtk.so` only when `-display gtk` is requested (headless usage never touches these libraries), and the container still needs a display forwarded from the host (X11/Wayland) to show a window.
+
 ## Building
 
 ### CI

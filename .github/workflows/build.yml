@@ -74,6 +74,17 @@ jobs:
             local/qemu-builder:${{ steps.ptag.outputs.tag }} \
             ls -l /usr/local/share/qemu/opensbi-riscv32-generic-fw_dynamic.bin
 
+      - name: Smoke test — GTK display available as loadable module
+        run: |
+          docker run --rm --platform=${{ matrix.platform }} \
+            local/qemu-builder:${{ steps.ptag.outputs.tag }} \
+            ls -l /usr/local/lib/qemu/ui-gtk.so
+          displays=$(docker run --rm --platform=${{ matrix.platform }} \
+            local/qemu-builder:${{ steps.ptag.outputs.tag }} \
+            qemu-system-aarch64 -display help)
+          echo "$displays"
+          echo "$displays" | grep -qw gtk
+
       - name: Summary
         run: |
           echo "::notice::Smoke tests passed for ${{ matrix.platform }} — qemu-system-aarch64 + qemu-system-riscv32 v${{ steps.qver.outputs.version }}"
