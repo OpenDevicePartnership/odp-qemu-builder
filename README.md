@@ -46,6 +46,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgtk-3-0t64 &
 
 QEMU loads `ui-gtk.so` only when `-display gtk` is requested (headless usage never touches these libraries), and the container still needs a display forwarded from the host (X11/Wayland) to show a window.
 
+### EC GPIO wake channel
+
+The RISC-V `ec` machine optionally connects GPIO1 to the `ec-gpio1` chardev.
+For an active-high, idle-low wake wire, connect it to the AArch64 `virt` host's
+`gpio1` chardev using the same socket path (start the host first):
+
+```text
+# Host QEMU, in its existing ACPI/GED firmware configuration:
+-chardev socket,id=gpio1,path=/tmp/ec-wake.sock,server=on,wait=off
+# EC QEMU:
+-chardev socket,id=ec-gpio1,path=/tmp/ec-wake.sock
+```
+
+EC GPIO OUT bit 1 at `0x10003004` drives host PL061 pin 1 at `0x09030000`,
+which shares GIC SPI 7 (INTID 39) with the other PL061 pins. Configure the
+host pin as a level-high input interrupt; the wire alone does not implement
+CPU suspend/resume. GPIO0 (`ec-gpio0` / `gpio0`) remains the independent HID
+channel. Both EC backends are optional; unused pins and reset behavior are
+unchanged. No EC GPIO2 source-detection channel is added.
+
 ## Building
 
 ### CI
