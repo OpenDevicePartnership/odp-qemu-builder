@@ -44,6 +44,7 @@ RUN --mount=type=cache,id=ccache-${TARGETARCH},target=/root/.cache/ccache \
     git apply /tmp/qemu-bus-emulation.patch && \
     PATH="/usr/lib/ccache:${PATH}" ./configure --target-list=aarch64-softmmu,riscv32-softmmu --enable-plugins --enable-tpm --enable-gtk --enable-modules --prefix=/usr/local --libdir=/usr/local/lib && \
     PATH="/usr/lib/ccache:${PATH}" ninja -C build qemu-system-aarch64 qemu-system-riscv32 && \
+    (cd build && ./pyvenv/bin/meson test --print-errorlogs qtest-riscv32/odp-gpio-test) && \
     ninja -C build install && \
     cd .. && \
     rm -rf qemu

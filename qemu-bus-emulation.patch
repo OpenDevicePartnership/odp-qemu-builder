@@ -273,10 +273,10 @@ index 0000000000..40714c8791
 +    bool
 diff --git a/hw/odp/gpio.c b/hw/odp/gpio.c
 new file mode 100644
-index 0000000000..eae96ef325
+index 0000000000..239f27ff0c
 --- /dev/null
 +++ b/hw/odp/gpio.c
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,423 @@
 +/*
 + * ODP socket-backed virtual GPIO controller
 + *
@@ -306,6 +306,7 @@ index 0000000000..eae96ef325
 +
 +#include "qemu/osdep.h"
 +#include "qapi/error.h"
++#include "qemu/error-report.h"
 +#include "qemu/log.h"
 +#include "hw/sysbus.h"
 +#include "hw/irq.h"
@@ -323,9 +324,11 @@ index 0000000000..eae96ef325
 +#define ODP_GPIO_REG_IRQ_POL   0x0c /* 0 = low/falling, 1 = high/rising (R/W) */
 +#define ODP_GPIO_REG_IRQ_EN    0x10 /* per-pin interrupt enable    (R/W)   */
 +#define ODP_GPIO_REG_IRQ_PEND  0x14 /* per-pin interrupt pending   (R/W1C) */
++#define ODP_GPIO_REG_INPUT_INITIALIZED 0x18 /* explicitly seeded inputs (R) */
 +#define ODP_GPIO_MMIO_SIZE     0x1000
 +
 +#define ODP_GPIO_NUM_PINS      32
++#define ODP_GPIO_POWER_PIN     2
 +
 +typedef struct OdpGpioPin {
 +    OdpGpioState *s;
@@ -348,6 +351,9 @@ index 0000000000..eae96ef325
 +    uint32_t irq_pol;
 +    uint32_t irq_en;
 +    uint32_t irq_pend;
++
++    uint32_t input_reset;
++    uint32_t input_reset_mask;
 +
 +    /* Per-pin chardev callback context (carries the pin index). */
 +    OdpGpioPin pin[ODP_GPIO_NUM_PINS];
@@ -447,7 +453,24 @@ index 0000000000..eae96ef325
 +
 +    /* Each byte is a fresh level for this pin; only the latest one matters. */
 +    for (i = 0; i < size; i++) {
++        if (p->index == ODP_GPIO_POWER_PIN && buf[i] > 1) {
++            error_report("%s: gpio2 invalid input byte 0x%02x "
++                         "(expected 0 or 1)",
++                         TYPE_ODP_GPIO, buf[i]);
++            continue;
++        }
 +        odp_gpio_set_input(p->s, p->index, buf[i] != 0);
++    }
++}
++
++static void odp_gpio_event(void *opaque, QEMUChrEvent event)
++{
++    OdpGpioPin *p = opaque;
++
++    if (p->index == ODP_GPIO_POWER_PIN && event == CHR_EVENT_CLOSED) {
++        warn_report("%s: gpio2 source control disconnected; "
++                    "retaining input level %u", TYPE_ODP_GPIO,
++                    (p->s->in >> ODP_GPIO_POWER_PIN) & 1u);
 +    }
 +}
 +
@@ -456,8 +479,8 @@ index 0000000000..eae96ef325
 +    OdpGpioPin *p = opaque;
 +
 +    qemu_chr_fe_set_handlers(&p->s->chr[p->index], odp_gpio_can_receive,
-+                             odp_gpio_receive, NULL, odp_gpio_be_change,
-+                             opaque, NULL, true);
++                             odp_gpio_receive, odp_gpio_event,
++                             odp_gpio_be_change, opaque, NULL, true);
 +    return 0;
 +}
 +
@@ -482,6 +505,8 @@ index 0000000000..eae96ef325
 +        return s->irq_en;
 +    case ODP_GPIO_REG_IRQ_PEND:
 +        return s->irq_pend;
++    case ODP_GPIO_REG_INPUT_INITIALIZED:
++        return s->input_reset_mask;
 +    default:
 +        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad read offset 0x%" HWADDR_PRIx "\n",
 +                      TYPE_ODP_GPIO, offset);
@@ -495,6 +520,12 @@ index 0000000000..eae96ef325
 +    OdpGpioState *s = opaque;
 +
 +    switch (offset) {
++    case ODP_GPIO_REG_INPUT_INITIALIZED:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: write to read-only INPUT_INITIALIZED register\n",
++                      TYPE_ODP_GPIO);
++        break;
++
 +    case ODP_GPIO_REG_IN:
 +        qemu_log_mask(LOG_GUEST_ERROR, "%s: write to read-only IN register\n",
 +                      TYPE_ODP_GPIO);
@@ -562,16 +593,32 @@ index 0000000000..eae96ef325
 +    OdpGpioState *s = ODP_GPIO(dev);
 +    int i;
 +
++    if (s->input_reset & ~s->input_reset_mask) {
++        error_setg(errp, "input-reset sets bits outside input-reset-mask");
++        return;
++    }
++    if (qemu_chr_fe_backend_connected(&s->chr[ODP_GPIO_POWER_PIN]) &&
++        !(s->input_reset_mask & (1u << ODP_GPIO_POWER_PIN))) {
++        error_setg(errp, "gpio2 requires explicit input-reset-mask bit 2");
++        return;
++    }
++
++    s->in = s->input_reset;
++
 +    for (i = 0; i < ODP_GPIO_NUM_PINS; i++) {
 +        s->pin[i].s = s;
 +        s->pin[i].index = i;
 +
 +        if (qemu_chr_fe_backend_connected(&s->chr[i])) {
 +            qemu_chr_fe_set_handlers(&s->chr[i], odp_gpio_can_receive,
-+                                     odp_gpio_receive, NULL,
++                                     odp_gpio_receive, odp_gpio_event,
 +                                     odp_gpio_be_change, &s->pin[i], NULL,
 +                                     true);
 +        }
++    }
++    if ((s->input_reset_mask & (1u << ODP_GPIO_POWER_PIN)) &&
++        !qemu_chr_fe_backend_open(&s->chr[ODP_GPIO_POWER_PIN])) {
++        odp_gpio_event(&s->pin[ODP_GPIO_POWER_PIN], CHR_EVENT_CLOSED);
 +    }
 +}
 +
@@ -579,7 +626,8 @@ index 0000000000..eae96ef325
 +{
 +    OdpGpioState *s = ODP_GPIO(obj);
 +
-+    s->in = 0;
++    /* Explicit external inputs outlive an EC reset. */
++    s->in &= s->input_reset_mask;
 +    s->out = 0;
 +    s->irq_trig = 0;
 +    s->irq_pol = 0;
@@ -590,6 +638,8 @@ index 0000000000..eae96ef325
 +}
 +
 +static const Property odp_gpio_properties[] = {
++    DEFINE_PROP_UINT32("input-reset", OdpGpioState, input_reset, 0),
++    DEFINE_PROP_UINT32("input-reset-mask", OdpGpioState, input_reset_mask, 0),
 +    DEFINE_PROP_CHR("gpio0",  OdpGpioState, chr[0]),
 +    DEFINE_PROP_CHR("gpio1",  OdpGpioState, chr[1]),
 +    DEFINE_PROP_CHR("gpio2",  OdpGpioState, chr[2]),
@@ -2238,10 +2288,10 @@ index e6a0ac1fa1..984e9cf6d7 100644
      default y
 diff --git a/hw/riscv/ec.c b/hw/riscv/ec.c
 new file mode 100644
-index 0000000000..2047b32a7a
+index 0000000000..56364d2979
 --- /dev/null
 +++ b/hw/riscv/ec.c
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,253 @@
 +/*
 + * QEMU RISC-V Embedded Controller (EC) Board
 + *
@@ -2440,8 +2490,8 @@ index 0000000000..2047b32a7a
 +                       qdev_get_gpio_in(s->plic, EC_I2C_TARGET_IRQ));
 +
 +    /*
-+     * Socket-backed bidirectional GPIO controller. Pins 0 and 1 use optional
-+     * ec-gpio0 and ec-gpio1 chardev backends; the device still maps without
++     * Socket-backed bidirectional GPIO controller. Pins 0 through 2 use optional
++     * ec-gpio0 through ec-gpio2 chardev backends; the device still maps without
 +     * peers attached.
 +     */
 +    s->gpio0 = qdev_new(TYPE_ODP_GPIO);
@@ -2454,6 +2504,11 @@ index 0000000000..2047b32a7a
 +        gpio_chr = qemu_chr_find("ec-gpio1");
 +        if (gpio_chr) {
 +            qdev_prop_set_chr(s->gpio0, "gpio1", gpio_chr);
++        }
++
++        gpio_chr = qemu_chr_find("ec-gpio2");
++        if (gpio_chr) {
++            qdev_prop_set_chr(s->gpio0, "gpio2", gpio_chr);
 +        }
 +    }
 +    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->gpio0), &error_fatal);
@@ -2687,3 +2742,308 @@ index 0000000000..71089ce5b1
 +    (EC_PLIC_CONTEXT_BASE + 1 * EC_PLIC_CONTEXT_STRIDE)
 +
 +#endif
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index 3136d15e0f..9621daeef1 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -274,2 +274,3 @@ qtests_s390x = \
+ qtests_riscv32 = \
++  (config_all_devices.has_key('CONFIG_RISCV_EC') and host_os != 'windows' ? ['odp-gpio-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_SIFIVE_E_AON') ? ['sifive-e-aon-watchdog-test'] : [])
+diff --git a/tests/qtest/odp-gpio-test.c b/tests/qtest/odp-gpio-test.c
+new file mode 100644
+index 0000000000..0e584d1bff
+--- /dev/null
++++ b/tests/qtest/odp-gpio-test.c
+@@ -0,0 +1,291 @@
++/*
++ * ODP EC GPIO external-power input tests.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/sockets.h"
++#include "libqtest.h"
++
++#define EC_ARGS "-machine ec -cpu rv32 -m 16M -bios none -nodefaults"
++#define GPIO_IN          0x10003000
++#define GPIO_OUT         0x10003004
++#define GPIO_IRQ_TRIG    0x10003008
++#define GPIO_IRQ_POL     0x1000300c
++#define GPIO_IRQ_EN      0x10003010
++#define GPIO_IRQ_PEND    0x10003014
++#define GPIO_INITIALIZED 0x10003018
++#define POWER_BIT       4
++#define PLIC_PENDING    0x0c001000
++
++typedef struct GpioTest {
++    QTestState *qts;
++    char *log;
++    int peer;
++} GpioTest;
++
++static GpioTest start_gpio(uint32_t mask, uint32_t value, int pin)
++{
++    GpioTest t = { .peer = -1 };
++    g_autofree char *chardev = NULL;
++    g_autofree char *quoted_log = NULL;
++    int pair[2];
++    int fd = g_file_open_tmp("odp-gpio-XXXXXX", &t.log, NULL);
++
++    g_assert_cmpint(fd, >=, 0);
++    close(fd);
++    quoted_log = g_shell_quote(t.log);
++    if (pin >= 0) {
++        g_assert_cmpint(socketpair(AF_UNIX, SOCK_STREAM, 0, pair), ==, 0);
++        qemu_set_cloexec(pair[0]);
++        t.peer = pair[0];
++        chardev = g_strdup_printf("-chardev socket,id=ec-gpio%d,fd=%d",
++                                  pin, pair[1]);
++    }
++    t.qts = qtest_initf(EC_ARGS
++                       " -global odp-gpio.input-reset-mask=0x%x"
++                       " -global odp-gpio.input-reset=0x%x %s 2>%s",
++                       mask, value, chardev ?: "", quoted_log);
++    if (pin >= 0) {
++        close(pair[1]);
++    }
++    return t;
++}
++
++static void stop_gpio(GpioTest *t)
++{
++    qtest_quit(t->qts);
++    if (t->peer >= 0) {
++        close(t->peer);
++    }
++    unlink(t->log);
++    g_free(t->log);
++}
++
++static void expect_input(GpioTest *t, uint32_t value)
++{
++    int64_t deadline = g_get_monotonic_time() + 5 * G_TIME_SPAN_SECOND;
++    uint32_t actual;
++
++    do {
++        actual = qtest_readl(t->qts, GPIO_IN);
++        if (actual == value) {
++            return;
++        }
++    } while (g_get_monotonic_time() < deadline);
++    g_assert_cmphex(actual, ==, value);
++}
++
++static void expect_log(GpioTest *t, const char *message)
++{
++    int64_t deadline = g_get_monotonic_time() + 5 * G_TIME_SPAN_SECOND;
++
++    do {
++        g_autofree char *contents = NULL;
++
++        g_assert_true(g_file_get_contents(t->log, &contents, NULL, NULL));
++        if (strstr(contents, message)) {
++            return;
++        }
++    } while (g_get_monotonic_time() < deadline);
++    g_error("Missing GPIO diagnostic: %s", message);
++}
++
++static void send_level(GpioTest *t, uint8_t level)
++{
++    g_assert_cmpint(send(t->peer, &level, 1, 0), ==, 1);
++}
++
++static void assert_reset_registers(GpioTest *t)
++{
++    for (uint64_t addr = GPIO_OUT; addr <= GPIO_IRQ_PEND; addr += 4) {
++        g_assert_cmphex(qtest_readl(t->qts, addr), ==, 0);
++    }
++}
++
++static void test_uninitialized(void)
++{
++    QTestState *qts = qtest_init(EC_ARGS);
++
++    g_assert_cmphex(qtest_readl(qts, GPIO_INITIALIZED), ==, 0);
++    g_assert_cmphex(qtest_readl(qts, GPIO_IN), ==, 0);
++    qtest_system_reset(qts);
++    g_assert_cmphex(qtest_readl(qts, GPIO_INITIALIZED), ==, 0);
++    qtest_quit(qts);
++}
++
++static void test_initial(gconstpointer data)
++{
++    uint32_t value = GPOINTER_TO_UINT(data);
++    GpioTest t = start_gpio(POWER_BIT, value, -1);
++
++    g_assert_cmphex(qtest_readl(t.qts, GPIO_IN), ==, value);
++    g_assert_cmphex(qtest_readl(t.qts, GPIO_INITIALIZED), ==, POWER_BIT);
++    expect_log(&t, "gpio2 source control disconnected");
++    qtest_writel(t.qts, GPIO_INITIALIZED, 0);
++    g_assert_cmphex(qtest_readl(t.qts, GPIO_INITIALIZED), ==, POWER_BIT);
++    qtest_writel(t.qts, GPIO_OUT, 3);
++    qtest_system_reset(t.qts);
++    g_assert_cmphex(qtest_readl(t.qts, GPIO_IN), ==, value);
++    g_assert_cmphex(qtest_readl(t.qts, GPIO_INITIALIZED), ==, POWER_BIT);
++    assert_reset_registers(&t);
++    stop_gpio(&t);
++}
++
++static void assert_invalid_config(const char *options, const char *message)
++{
++    g_autofree char *log = NULL;
++    g_autofree char *args = NULL;
++    g_autofree char *quoted_log = NULL;
++    g_autofree char *contents = NULL;
++    QTestState *qts;
++    int fd = g_file_open_tmp("odp-gpio-error-XXXXXX", &log, NULL);
++
++    g_assert_cmpint(fd, >=, 0);
++    close(fd);
++    quoted_log = g_shell_quote(log);
++    args = g_strdup_printf(EC_ARGS " %s 2>%s", options, quoted_log);
++    qts = qtest_init_with_env_and_capabilities(NULL, args, NULL, false);
++    qtest_set_expected_status(qts, EXIT_FAILURE);
++    qtest_wait_qemu(qts);
++    g_assert_true(g_file_get_contents(log, &contents, NULL, NULL));
++    g_assert_nonnull(strstr(contents, message));
++    qtest_quit(qts);
++    unlink(log);
++}
++
++static void test_missing_initialization(void)
++{
++    assert_invalid_config("-chardev null,id=ec-gpio2",
++                          "gpio2 requires explicit input-reset-mask bit 2");
++}
++
++static void test_invalid_mask(void)
++{
++    assert_invalid_config("-global odp-gpio.input-reset-mask=4 "
++                          "-global odp-gpio.input-reset=8",
++                          "input-reset sets bits outside input-reset-mask");
++}
++
++static void test_runtime(gconstpointer data)
++{
++    uint32_t initial = GPOINTER_TO_UINT(data);
++    GpioTest t = start_gpio(POWER_BIT, initial, 2);
++    uint32_t value = initial;
++
++    g_assert_cmphex(qtest_readl(t.qts, GPIO_IN), ==, initial);
++    g_assert_cmphex(qtest_readl(t.qts, GPIO_INITIALIZED), ==, POWER_BIT);
++    for (int i = 0; i < 3; i++) {
++        value ^= POWER_BIT;
++        qtest_writel(t.qts, GPIO_IRQ_TRIG, POWER_BIT);
++        qtest_writel(t.qts, GPIO_IRQ_POL, value);
++        qtest_writel(t.qts, GPIO_IRQ_PEND, POWER_BIT);
++        qtest_writel(t.qts, GPIO_IRQ_EN, POWER_BIT);
++        g_assert_cmphex(qtest_readl(t.qts, GPIO_IRQ_PEND) & POWER_BIT, ==, 0);
++        send_level(&t, value != 0);
++        expect_input(&t, value);
++        g_assert_cmphex(qtest_readl(t.qts, GPIO_IRQ_PEND) & POWER_BIT,
++                        ==, POWER_BIT);
++        g_assert_cmphex(qtest_readl(t.qts, PLIC_PENDING) & (1u << 4),
++                        ==, 1u << 4);
++        qtest_writel(t.qts, GPIO_OUT, 3);
++        qtest_system_reset(t.qts);
++        g_assert_cmphex(qtest_readl(t.qts, GPIO_IN), ==, value);
++        g_assert_cmphex(qtest_readl(t.qts, GPIO_INITIALIZED), ==, POWER_BIT);
++        assert_reset_registers(&t);
++    }
++    qtest_writel(t.qts, GPIO_IRQ_POL, value);
++    qtest_writel(t.qts, GPIO_IRQ_EN, POWER_BIT);
++    qtest_writel(t.qts, GPIO_IRQ_PEND, POWER_BIT);
++    g_assert_cmphex(qtest_readl(t.qts, GPIO_IRQ_PEND) & POWER_BIT,
++                    ==, POWER_BIT);
++    send_level(&t, value == 0);
++    expect_input(&t, value ^ POWER_BIT);
++    g_assert_cmphex(qtest_readl(t.qts, GPIO_IRQ_PEND) & POWER_BIT, ==, 0);
++    stop_gpio(&t);
++}
++
++static void test_invalid_bytes(void)
++{
++    GpioTest t = start_gpio(POWER_BIT, 0, 2);
++    const uint8_t invalid[] = { 2, '0', '1', 255 };
++
++    qtest_writel(t.qts, GPIO_IRQ_POL, POWER_BIT);
++    qtest_writel(t.qts, GPIO_IRQ_EN, POWER_BIT);
++    for (size_t i = 0; i < G_N_ELEMENTS(invalid); i++) {
++        g_autofree char *message =
++            g_strdup_printf("gpio2 invalid input byte 0x%02x", invalid[i]);
++
++        send_level(&t, invalid[i]);
++        expect_log(&t, message);
++        g_assert_cmphex(qtest_readl(t.qts, GPIO_IN), ==, 0);
++        g_assert_cmphex(qtest_readl(t.qts, GPIO_IRQ_PEND) & POWER_BIT, ==, 0);
++    }
++    send_level(&t, 1);
++    expect_input(&t, POWER_BIT);
++    stop_gpio(&t);
++}
++
++static void test_disconnect(gconstpointer data)
++{
++    uint32_t value = GPOINTER_TO_UINT(data);
++    GpioTest t = start_gpio(POWER_BIT, value ^ POWER_BIT, 2);
++
++    send_level(&t, value != 0);
++    expect_input(&t, value);
++    shutdown(t.peer, SHUT_RDWR);
++    close(t.peer);
++    t.peer = -1;
++    expect_log(&t, "gpio2 source control disconnected");
++    g_assert_cmphex(qtest_readl(t.qts, GPIO_IN), ==, value);
++    qtest_system_reset(t.qts);
++    g_assert_cmphex(qtest_readl(t.qts, GPIO_IN), ==, value);
++    g_assert_cmphex(qtest_readl(t.qts, GPIO_INITIALIZED), ==, POWER_BIT);
++    stop_gpio(&t);
++}
++
++static void test_legacy_pin(gconstpointer data)
++{
++    int pin = GPOINTER_TO_INT(data);
++    GpioTest t = start_gpio(0, 0, pin);
++    uint8_t received;
++    GPollFD pfd = { .fd = t.peer, .events = G_IO_IN };
++
++    qtest_writel(t.qts, GPIO_OUT, 1u << pin);
++    g_assert_cmpint(g_poll(&pfd, 1, 5000), ==, 1);
++    g_assert_cmpint(recv(t.peer, &received, 1, 0), ==, 1);
++    g_assert_cmpint(received, ==, 1);
++    send_level(&t, 255);
++    expect_input(&t, 1u << pin);
++    qtest_system_reset(t.qts);
++    g_assert_cmphex(qtest_readl(t.qts, GPIO_IN), ==, 0);
++    g_assert_cmphex(qtest_readl(t.qts, GPIO_INITIALIZED), ==, 0);
++    assert_reset_registers(&t);
++    g_assert_cmpint(g_poll(&pfd, 1, 0), ==, 0);
++    stop_gpio(&t);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    qtest_add_func("/odp-gpio/uninitialized", test_uninitialized);
++    qtest_add_data_func("/odp-gpio/initial-ac",
++                        GUINT_TO_POINTER(4), test_initial);
++    qtest_add_data_func("/odp-gpio/initial-dc",
++                        GUINT_TO_POINTER(0), test_initial);
++    qtest_add_func("/odp-gpio/missing-initialization",
++                   test_missing_initialization);
++    qtest_add_func("/odp-gpio/invalid-mask", test_invalid_mask);
++    qtest_add_data_func("/odp-gpio/runtime-from-ac",
++                        GUINT_TO_POINTER(4), test_runtime);
++    qtest_add_data_func("/odp-gpio/runtime-from-dc",
++                        GUINT_TO_POINTER(0), test_runtime);
++    qtest_add_func("/odp-gpio/invalid-bytes", test_invalid_bytes);
++    qtest_add_data_func("/odp-gpio/disconnect-ac",
++                        GUINT_TO_POINTER(4), test_disconnect);
++    qtest_add_data_func("/odp-gpio/disconnect-dc",
++                        GUINT_TO_POINTER(0), test_disconnect);
++    qtest_add_data_func("/odp-gpio/gpio0", GINT_TO_POINTER(0), test_legacy_pin);
++    qtest_add_data_func("/odp-gpio/gpio1", GINT_TO_POINTER(1), test_legacy_pin);
++    return g_test_run();
++}
