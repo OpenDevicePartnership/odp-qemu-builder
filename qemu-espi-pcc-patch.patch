@@ -11,10 +11,18 @@ index 7827004ff7..7eab7303be 100644
  
  config CUBIEBOARD
 diff --git a/hw/arm/virt-acpi-build.c b/hw/arm/virt-acpi-build.c
-index 5420ef1eca..f00610b212 100644
+index 5420ef1eca..baa5d6e5f3 100644
 --- a/hw/arm/virt-acpi-build.c
 +++ b/hw/arm/virt-acpi-build.c
-@@ -915,6 +915,61 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
+@@ -49,6 +49,7 @@
+ #include "hw/pci-host/gpex.h"
+ #include "hw/arm/virt.h"
+ #include "hw/intc/arm_gicv3_its_common.h"
++#include "hw/odp/espi-controller.h"
+ #include "hw/mem/nvdimm.h"
+ #include "hw/platform-bus.h"
+ #include "system/numa.h"
+@@ -915,6 +916,63 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
      free_aml_allocator();
  }
  
@@ -31,8 +39,10 @@ index 5420ef1eca..f00610b212 100644
 +    build_append_int_noprefix(table_data, 0, 8);
 +
 +    for (channel = 0; channel < 2; channel++) {
-+        uint64_t shared_base = 0x090f0000 + channel * 0x10000;
-+        uint64_t control_base = 0x09110000 + channel * 0x20;
++        uint64_t shared_base = ODP_ESPI_SHARED_BASE +
++                               channel * ODP_ESPI_SHARED_STRIDE;
++        uint64_t control_base = ODP_ESPI_CONTROL_BASE +
++                                channel * ODP_ESPI_CONTROL_STRIDE;
 +        unsigned subspace_start = table_data->len;
 +        bool initiator = channel == 0;
 +
@@ -76,7 +86,7 @@ index 5420ef1eca..f00610b212 100644
  typedef
  struct AcpiBuildState {
      /* Copy of table in RAM (for patching). */
-@@ -1033,6 +1088,9 @@ void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables)
+@@ -1033,6 +1091,9 @@ void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables)
                     vms->oem_id, vms->oem_table_id);
      }
  
@@ -160,10 +170,10 @@ index 40714c8791..98356ea6fe 100644
  
 diff --git a/hw/odp/espi-controller.c b/hw/odp/espi-controller.c
 new file mode 100644
-index 0000000000..a9d6a2a713
+index 0000000000..c0d4f2c9f7
 --- /dev/null
 +++ b/hw/odp/espi-controller.c
-@@ -0,0 +1,935 @@
+@@ -0,0 +1,936 @@
 +#include "qemu/osdep.h"
 +#include "qemu/bswap.h"
 +#include "qemu/main-loop.h"
@@ -183,7 +193,6 @@ index 0000000000..a9d6a2a713
 +#define ESPI_DATA_WINDOW_COUNT 2
 +#define ESPI_WINDOW_COUNT      (ESPI_DATA_WINDOW_COUNT + 1)
 +#define ESPI_WINDOW_SIZE       0x1000
-+#define ESPI_CONTROL_STRIDE    0x20
 +#define ESPI_CONTROL_STATUS    0x00
 +#define ESPI_CONTROL_DOORBELL  0x04
 +#define ESPI_CONTROL_IRQ_ACK   0x0c
@@ -954,10 +963,10 @@ index 0000000000..a9d6a2a713
 +    bool valid = size >= 1 && size <= 8 && !(offset & (size - 1));
 +
 +    if (window == &window->controller->windows[ESPI_DATA_WINDOW_COUNT]) {
-+        hwaddr reg = offset % ESPI_CONTROL_STRIDE;
++        hwaddr reg = offset % ODP_ESPI_CONTROL_STRIDE;
 +
 +        valid = valid && size == 4 &&
-+                offset < ESPI_DATA_WINDOW_COUNT * ESPI_CONTROL_STRIDE &&
++            offset < ESPI_DATA_WINDOW_COUNT * ODP_ESPI_CONTROL_STRIDE &&
 +                (reg == ESPI_CONTROL_STATUS ||
 +                 reg == ESPI_CONTROL_DOORBELL ||
 +                 reg == ESPI_CONTROL_IRQ_ACK);
@@ -996,7 +1005,9 @@ index 0000000000..a9d6a2a713
 +    for (index = 0; index < ESPI_WINDOW_COUNT; index++) {
 +        OdpESPIWindow *window = &s->windows[index];
 +
-+        window->base = 0x090f0000 + index * 0x10000;
++        window->base = index == ESPI_DATA_WINDOW_COUNT ?
++                       ODP_ESPI_CONTROL_BASE :
++                       ODP_ESPI_SHARED_BASE + index * ODP_ESPI_SHARED_STRIDE;
 +        window->size = ESPI_WINDOW_SIZE;
 +        window->enabled = odp_espi_window_valid(window, window->base,
 +                                                window->size);
@@ -2262,10 +2273,10 @@ index 7ad787aa90..f9a77bafb7 100644
  
 diff --git a/include/hw/odp/espi-controller.h b/include/hw/odp/espi-controller.h
 new file mode 100644
-index 0000000000..5a676817d7
+index 0000000000..51fb5ec37f
 --- /dev/null
 +++ b/include/hw/odp/espi-controller.h
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,21 @@
 +#ifndef HW_ODP_ESPI_CONTROLLER_H
 +#define HW_ODP_ESPI_CONTROLLER_H
 +
@@ -2274,6 +2285,16 @@ index 0000000000..5a676817d7
 +
 +#define TYPE_ODP_ESPI_CONTROLLER "odp-espi-controller"
 +#define ODP_ESPI_IRQ_COUNT 2
++
++/*
++ * Default host MMIO layout: two 4-KiB data windows spaced 64 KiB apart,
++ * plus a separate control window with one 0x20-byte group per channel.
++ */
++#define ODP_ESPI_SHARED_BASE    0x090f0000
++#define ODP_ESPI_SHARED_STRIDE  0x10000
++#define ODP_ESPI_CONTROL_BASE   0x09110000
++#define ODP_ESPI_CONTROL_STRIDE 0x20
++
 +OBJECT_DECLARE_SIMPLE_TYPE(OdpESPIControllerState, ODP_ESPI_CONTROLLER)
 +
 +#endif
