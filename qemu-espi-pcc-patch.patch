@@ -1,0 +1,2498 @@
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 7827004ff7..7eab7303be 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -38,6 +38,7 @@ config ARM_VIRT
+     select ACPI_CXL
+     select ACPI_HMAT
+     select ODP_I2C_CONTROLLER
++    select ODP_ESPI_CONTROLLER
+     select ODP_PL061
+ 
+ config CUBIEBOARD
+diff --git a/hw/arm/virt-acpi-build.c b/hw/arm/virt-acpi-build.c
+index 5420ef1eca..baa5d6e5f3 100644
+--- a/hw/arm/virt-acpi-build.c
++++ b/hw/arm/virt-acpi-build.c
+@@ -49,6 +49,7 @@
+ #include "hw/pci-host/gpex.h"
+ #include "hw/arm/virt.h"
+ #include "hw/intc/arm_gicv3_its_common.h"
++#include "hw/odp/espi-controller.h"
+ #include "hw/mem/nvdimm.h"
+ #include "hw/platform-bus.h"
+ #include "system/numa.h"
+@@ -915,6 +916,63 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
+     free_aml_allocator();
+ }
+ 
++static void build_pcct(GArray *table_data, BIOSLinker *linker,
++                       VirtMachineState *vms)
++{
++    AcpiTable table = { .sig = "PCCT", .rev = 2, .oem_id = vms->oem_id,
++                       .oem_table_id = vms->oem_table_id };
++    uint32_t irq = vms->irqmap[VIRT_ESPI] + ARM_SPI_BASE;
++    unsigned channel;
++
++    acpi_table_begin(&table, table_data);
++    build_append_int_noprefix(table_data, 1, 4);
++    build_append_int_noprefix(table_data, 0, 8);
++
++    for (channel = 0; channel < 2; channel++) {
++        uint64_t shared_base = ODP_ESPI_SHARED_BASE +
++                               channel * ODP_ESPI_SHARED_STRIDE;
++        uint64_t control_base = ODP_ESPI_CONTROL_BASE +
++                                channel * ODP_ESPI_CONTROL_STRIDE;
++        unsigned subspace_start = table_data->len;
++        bool initiator = channel == 0;
++
++        build_append_int_noprefix(table_data, channel + 3, 1);
++        build_append_int_noprefix(table_data, 164, 1);
++    build_append_int_noprefix(table_data, irq + channel, 4);
++        build_append_int_noprefix(table_data, 0, 1);
++        build_append_int_noprefix(table_data, 0, 1);
++        build_append_int_noprefix(table_data, shared_base, 8);
++        build_append_int_noprefix(table_data, 4096, 4);
++        build_append_gas(table_data, AML_AS_SYSTEM_MEMORY, 32, 0, 3,
++                         control_base + 0x04);
++        build_append_int_noprefix(table_data, 0, 8);
++        build_append_int_noprefix(table_data, 1, 8);
++        build_append_int_noprefix(table_data, initiator ? 100000 : 0, 4);
++        build_append_int_noprefix(table_data, 0, 4);
++        build_append_int_noprefix(table_data, 0, 4);
++        build_append_gas(table_data, AML_AS_SYSTEM_MEMORY, 32, 0, 3,
++                         control_base + 0x0c);
++        build_append_int_noprefix(table_data, 0, 8);
++        build_append_int_noprefix(table_data, 1, 8);
++        build_append_int_noprefix(table_data, 0, 8);
++        build_append_gas(table_data, AML_AS_SYSTEM_MEMORY, 32, 0, 3,
++                         control_base);
++        build_append_int_noprefix(table_data, 1, 8);
++        build_append_gas(table_data, AML_AS_SYSTEM_MEMORY, 32, 0, 3,
++                         control_base);
++        build_append_int_noprefix(table_data, 0xfffffffe, 8);
++        build_append_int_noprefix(table_data, initiator ? 0 : 1, 8);
++        build_append_gas(table_data, AML_AS_SYSTEM_MEMORY, initiator ? 32 : 0,
++                         0, initiator ? 3 : 0, initiator ? control_base : 0);
++        build_append_int_noprefix(table_data, initiator ? 2 : 0, 8);
++
++        g_assert(table_data->len - subspace_start == 164);
++    }
++
++    g_assert(table_data->len - table.table_offset == 376);
++    acpi_table_end(linker, &table);
++}
++
+ typedef
+ struct AcpiBuildState {
+     /* Copy of table in RAM (for patching). */
+@@ -1033,6 +1091,9 @@ void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables)
+                    vms->oem_id, vms->oem_table_id);
+     }
+ 
++    acpi_add_table(table_offsets, tables_blob);
++    build_pcct(tables_blob, tables->linker, vms);
++
+     /* XSDT is pointed to by RSDP */
+     xsdt = tables_blob->len;
+     build_xsdt(tables_blob, tables->linker, table_offsets, vms->oem_id,
+diff --git a/hw/arm/virt.c b/hw/arm/virt.c
+index 80913f466f..ea93fef17a 100644
+--- a/hw/arm/virt.c
++++ b/hw/arm/virt.c
+@@ -87,6 +87,7 @@
+ #include "hw/virtio/virtio-iommu.h"
+ #include "hw/char/pl011.h"
+ #include "hw/odp/i2c-controller.h"
++#include "hw/odp/espi-controller.h"
+ #include "hw/odp/pl061.h"
+ #include "chardev/char.h"
+ #include "qemu/guest-random.h"
+@@ -237,6 +238,7 @@ static const int a15irqmap[] = {
+     [VIRT_UART1] = 8,
+     [VIRT_ACPI_GED] = 9,
+     [VIRT_I2C] = 10,
++    [VIRT_ESPI] = 11,
+     [VIRT_MMIO] = 16, /* ...to 16 + NUM_VIRTIO_TRANSPORTS - 1 */
+     [VIRT_GIC_V2M] = 48, /* ...to 48 + NUM_GICV2M_SPIS - 1 */
+     [VIRT_SMMU] = 74,    /* ...to 74 + NUM_SMMU_IRQS - 1 */
+@@ -1051,6 +1053,26 @@ static void create_odp_i2c(const VirtMachineState *vms, MemoryRegion *mem)
+     g_free(nodename);
+ }
+ 
++static void create_odp_espi(const VirtMachineState *vms)
++{
++    int irq = vms->irqmap[VIRT_ESPI];
++    unsigned index;
++    DeviceState *dev = qdev_new(TYPE_ODP_ESPI_CONTROLLER);
++    SysBusDevice *busdev = SYS_BUS_DEVICE(dev);
++    Chardev *chr;
++
++    chr = qemu_chr_find("ec-espi-controller");
++    if (chr) {
++        qdev_prop_set_chr(dev, "chardev", chr);
++    }
++
++    sysbus_realize_and_unref(busdev, &error_fatal);
++    for (index = 0; index < ODP_ESPI_IRQ_COUNT; index++) {
++        sysbus_connect_irq(busdev, index,
++                           qdev_get_gpio_in(vms->gic, irq + index));
++    }
++}
++
+ /*
+  * Socket-backed PL061 GPIO controller. It presents the exact PL061 MMIO and
+  * interrupt interface (so an unmodified guest PL061 driver binds), but each of
+@@ -2514,6 +2536,7 @@ static void machvirt_init(MachineState *machine)
+     create_rtc(vms);
+ 
+     create_odp_i2c(vms, sysmem);
++    create_odp_espi(vms);
+ 
+     create_pcie(vms);
+ 
+diff --git a/hw/odp/Kconfig b/hw/odp/Kconfig
+index 40714c8791..98356ea6fe 100644
+--- a/hw/odp/Kconfig
++++ b/hw/odp/Kconfig
+@@ -4,6 +4,12 @@ config ODP_I2C_CONTROLLER
+ config ODP_I2C_TARGET
+     bool
+ 
++config ODP_ESPI_CONTROLLER
++    bool
++
++config ODP_ESPI_TARGET
++    bool
++
+ config ODP_GPIO
+     bool
+ 
+diff --git a/hw/odp/espi-controller.c b/hw/odp/espi-controller.c
+new file mode 100644
+index 0000000000..c0d4f2c9f7
+--- /dev/null
++++ b/hw/odp/espi-controller.c
+@@ -0,0 +1,936 @@
++#include "qemu/osdep.h"
++#include "qemu/bswap.h"
++#include "qemu/main-loop.h"
++#include "qemu/module.h"
++#include "qapi/error.h"
++#include "chardev/char-fe.h"
++#include "exec/address-spaces.h"
++#include "hw/core/cpu.h"
++#include "hw/irq.h"
++#include "hw/odp/espi-controller.h"
++#include "hw/odp/espi-proto.h"
++#include "hw/qdev-properties.h"
++#include "hw/qdev-properties-system.h"
++#include "migration/vmstate.h"
++#include "system/cpus.h"
++
++#define ESPI_DATA_WINDOW_COUNT 2
++#define ESPI_WINDOW_COUNT      (ESPI_DATA_WINDOW_COUNT + 1)
++#define ESPI_WINDOW_SIZE       0x1000
++#define ESPI_CONTROL_STATUS    0x00
++#define ESPI_CONTROL_DOORBELL  0x04
++#define ESPI_CONTROL_IRQ_ACK   0x0c
++#define ESPI_MAX_PAYLOAD       64
++#define ESPI_RESPONSE_MODIFIER (1U << 30)
++
++#define ESPI_ERROR_TIMEOUT    (1U << 0)
++#define ESPI_ERROR_CRC        (1U << 1)
++#define ESPI_ERROR_PROTOCOL   (1U << 2)
++#define ESPI_ERROR_LINK       (1U << 3)
++#define ESPI_ERROR_COMPLETION (1U << 4)
++#define ESPI_ERROR_WINDOW     (1U << 5)
++
++typedef struct OdpESPIWindow {
++    MemoryRegion iomem;
++    OdpESPIControllerState *controller;
++    uint32_t base;
++    uint32_t size;
++    bool enabled;
++    bool mapped;
++} OdpESPIWindow;
++
++struct OdpESPIControllerState {
++    SysBusDevice parent_obj;
++    CharBackend chr;
++    qemu_irq irq[ODP_ESPI_IRQ_COUNT];
++    OdpESPIWindow windows[ESPI_WINDOW_COUNT];
++    uint32_t errors;
++    uint32_t irq_level;
++    unsigned vwire_limit;
++    bool vwire_supported;
++    bool vwire_ready;
++    bool connected;
++    bool ready;
++    bool configured;
++    bool reset_needed;
++    bool crc_enabled;
++    bool busy;
++    bool failed;
++    bool pending;
++    bool expect_response;
++    bool receiving;
++    bool alert;
++    uint8_t command;
++    uint8_t tag;
++    uint16_t target_status;
++    uint8_t tx[ESPI_MAX_PAYLOAD + 16];
++    unsigned tx_size;
++    unsigned tx_pos;
++    uint8_t rx[ODP_ESPI_VWIRE_MAX_PACKET_SIZE + 4];
++    unsigned rx_size;
++    unsigned rx_needed;
++    uint32_t timeout_ms;
++    guint write_watch;
++    guint service_source;
++    QemuCond cond;
++};
++
++static void odp_espi_schedule_service(OdpESPIControllerState *s);
++static bool odp_espi_drain_vwires(OdpESPIControllerState *state,
++                                  int64_t deadline);
++
++static void odp_espi_update_irq(OdpESPIControllerState *state)
++{
++    unsigned index;
++
++    for (index = 0; index < ODP_ESPI_IRQ_COUNT; index++) {
++        bool level = (state->irq_level & (1U << index)) != 0;
++
++        qemu_set_irq(state->irq[index], level);
++    }
++}
++
++static void odp_espi_clear_vwires(OdpESPIControllerState *state)
++{
++    state->irq_level = 0;
++    state->vwire_ready = false;
++    state->target_status = 0;
++    state->alert = false;
++    odp_espi_update_irq(state);
++}
++
++static int64_t odp_espi_now_ms(void)
++{
++    return g_get_monotonic_time() / 1000;
++}
++
++static uint8_t odp_espi_crc8(const uint8_t *data, size_t length)
++{
++    uint8_t crc = ODP_ESPI_CRC8_INIT;
++    size_t index;
++    unsigned bit;
++
++    for (index = 0; index < length; index++) {
++        crc ^= data[index];
++        for (bit = 0; bit < 8; bit++) {
++            crc = (crc << 1) ^ ((crc & 0x80) ? ODP_ESPI_CRC8_POLYNOMIAL : 0);
++        }
++    }
++    return crc;
++}
++
++static void odp_espi_set_error(OdpESPIControllerState *state, uint32_t error)
++{
++    state->errors |= error;
++}
++
++static void odp_espi_cancel(OdpESPIControllerState *s, uint32_t error)
++{
++    odp_espi_set_error(s, error);
++    s->failed = true;
++    s->pending = false;
++    s->ready = false;
++    s->configured = false;
++    s->receiving = false;
++    odp_espi_clear_vwires(s);
++    if (s->write_watch) {
++        g_source_remove(s->write_watch);
++        s->write_watch = 0;
++    }
++    qemu_cond_broadcast(&s->cond);
++}
++
++static void odp_espi_disconnect(OdpESPIControllerState *s, uint32_t error)
++{
++    odp_espi_cancel(s, error);
++    qemu_chr_fe_disconnect(&s->chr);
++}
++
++static gboolean odp_espi_wakeup(void *opaque)
++{
++    return G_SOURCE_REMOVE;
++}
++
++static bool odp_espi_wait(OdpESPIControllerState *s, int64_t deadline)
++{
++    int64_t remaining = deadline - odp_espi_now_ms();
++
++    if (remaining <= 0) {
++        odp_espi_disconnect(s, ESPI_ERROR_TIMEOUT);
++        return false;
++    }
++    if (qemu_in_vcpu_thread()) {
++        CPUState *cpu = current_cpu;
++        bool running = cpu->running;
++
++        if (running) {
++            cpu_exec_end(cpu);
++        }
++        process_queued_cpu_work(cpu);
++        qemu_cond_timedwait_bql(&s->cond, MIN(remaining, 10));
++        if (running) {
++            bql_unlock();
++            cpu_exec_start(cpu);
++            bql_lock();
++        }
++    } else {
++        GSource *source = g_timeout_source_new(MIN(remaining, 10));
++
++        g_source_set_callback(source, odp_espi_wakeup, NULL, NULL);
++        g_source_attach(source, NULL);
++        g_main_context_iteration(NULL, true);
++        g_source_destroy(source);
++        g_source_unref(source);
++    }
++    return !s->failed;
++}
++
++static gboolean odp_espi_writable(void *unused, GIOCondition condition,
++                                   void *opaque);
++
++static void odp_espi_flush(OdpESPIControllerState *s)
++{
++    int written;
++
++    written = qemu_chr_fe_write(&s->chr, s->tx + s->tx_pos,
++                                s->tx_size - s->tx_pos);
++    if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
++        odp_espi_disconnect(s, ESPI_ERROR_LINK);
++        return;
++    }
++    if (written > 0) {
++        s->tx_pos += written;
++    }
++    if (s->tx_pos < s->tx_size) {
++        s->write_watch = qemu_chr_fe_add_watch(&s->chr, G_IO_OUT | G_IO_HUP,
++                                               odp_espi_writable, s);
++        if (!s->write_watch) {
++            odp_espi_disconnect(s, ESPI_ERROR_LINK);
++        }
++    } else if (!s->expect_response) {
++        s->pending = false;
++        qemu_cond_broadcast(&s->cond);
++    }
++}
++
++static gboolean odp_espi_writable(void *unused, GIOCondition condition,
++                                   void *opaque)
++{
++    OdpESPIControllerState *s = opaque;
++
++    s->write_watch = 0;
++    if (condition & G_IO_HUP) {
++        odp_espi_disconnect(s, ESPI_ERROR_LINK);
++    } else {
++        odp_espi_flush(s);
++    }
++    return G_SOURCE_REMOVE;
++}
++
++static bool odp_espi_transmit(OdpESPIControllerState *s, unsigned size,
++                              bool response, int64_t deadline)
++{
++    if (!s->connected || s->failed) {
++        return false;
++    }
++    s->tx_size = size;
++    s->tx_pos = 0;
++    s->rx_size = 0;
++    s->rx_needed = 0;
++    s->receiving = false;
++    s->expect_response = response;
++    s->alert = false;
++    s->pending = true;
++    odp_espi_flush(s);
++    while (s->pending) {
++        if (!odp_espi_wait(s, deadline)) {
++            return false;
++        }
++    }
++    return !s->failed;
++}
++
++static bool odp_espi_exchange(OdpESPIControllerState *s, uint8_t command,
++                              const uint8_t *data, unsigned length,
++                              int64_t deadline)
++{
++    s->command = command;
++    s->tx[0] = ODP_ESPI_WIRE_DATA;
++    s->tx[1] = command;
++    if (length) {
++        memcpy(s->tx + 2, data, length);
++    }
++    s->tx[length + 2] = odp_espi_crc8(s->tx + 1, length + 1);
++    return odp_espi_transmit(s, length + 3, true, deadline);
++}
++
++static bool odp_espi_configuration(OdpESPIControllerState *s, uint16_t address,
++                                   uint32_t *value, bool write,
++                                   int64_t deadline)
++{
++    uint8_t data[6];
++
++    stw_be_p(data, address);
++    if (write) {
++        stl_le_p(data + 2, *value);
++    }
++    if (!odp_espi_exchange(s, write ? ODP_ESPI_CMD_SET_CONFIGURATION :
++                                     ODP_ESPI_CMD_GET_CONFIGURATION,
++                           data, write ? 6 : 2, deadline)) {
++        return false;
++    }
++    if (!write) {
++        *value = ldl_le_p(s->rx + 1);
++    }
++    return true;
++}
++
++static bool odp_espi_prepare(OdpESPIControllerState *s, int64_t deadline)
++{
++    uint32_t value;
++    unsigned supported;
++    bool ready = s->ready;
++
++    if (s->reset_needed) {
++        odp_espi_clear_vwires(s);
++        s->crc_enabled = false;
++        s->tx[0] = ODP_ESPI_WIRE_RESET;
++        s->tx[1] = ODP_ESPI_WIRE_RESET_ASSERTED;
++        s->tx[2] = ODP_ESPI_WIRE_RESET;
++        s->tx[3] = ODP_ESPI_WIRE_RESET_DEASSERTED;
++        if (!odp_espi_transmit(s, 4, false, deadline)) {
++            return false;
++        }
++        s->reset_needed = false;
++    }
++    if (!s->configured) {
++        if (!odp_espi_configuration(s, ODP_ESPI_CONFIG_DEVICE_ID,
++                                    &value, false, deadline)) {
++            return false;
++        }
++        if ((value & ODP_ESPI_DEVICE_ID_VERSION_MASK) !=
++            ODP_ESPI_DEVICE_ID_VERSION) {
++            odp_espi_disconnect(s, ESPI_ERROR_PROTOCOL);
++            return false;
++        }
++        if (!odp_espi_configuration(s, ODP_ESPI_CONFIG_GENERAL,
++                                    &value, false, deadline)) {
++            return false;
++        }
++        if (!(value & ODP_ESPI_GENERAL_CHANNEL0_SUPPORTED)) {
++            odp_espi_disconnect(s, ESPI_ERROR_PROTOCOL);
++            return false;
++        }
++        s->vwire_supported = value & ODP_ESPI_GENERAL_CHANNEL1_SUPPORTED;
++        value = (value | ODP_ESPI_GENERAL_CRC_ENABLE) &
++                ~ESPI_RESPONSE_MODIFIER;
++        if (!odp_espi_configuration(s, ODP_ESPI_CONFIG_GENERAL,
++                                    &value, true, deadline)) {
++            return false;
++        }
++        s->crc_enabled = true;
++        if (!odp_espi_configuration(s, ODP_ESPI_CONFIG_CH0,
++                                    &value, false, deadline)) {
++            return false;
++        }
++        supported = (value & ODP_ESPI_CH0_MAX_PAYLOAD_SUPPORTED_MASK) >>
++                    ODP_ESPI_CH0_MAX_PAYLOAD_SUPPORTED_SHIFT;
++
++        if (supported < ODP_ESPI_SIZE_64B_CODE ||
++            supported > ODP_ESPI_SIZE_256B_CODE) {
++            odp_espi_disconnect(s, ESPI_ERROR_PROTOCOL);
++            return false;
++        }
++        value &= ~(ODP_ESPI_CH0_MAX_PAYLOAD_SELECTED_MASK |
++                   ODP_ESPI_CH0_MAX_READ_REQUEST_MASK |
++                   ODP_ESPI_CH0_BUS_MASTER_ENABLE);
++        value |= ODP_ESPI_CH0_ENABLE |
++            (ODP_ESPI_SIZE_64B_CODE <<
++             ODP_ESPI_CH0_MAX_PAYLOAD_SELECTED_SHIFT) |
++            (ODP_ESPI_SIZE_64B_CODE << ODP_ESPI_CH0_MAX_READ_REQUEST_SHIFT);
++        if (!odp_espi_configuration(s, ODP_ESPI_CONFIG_CH0,
++                                    &value, true, deadline)) {
++            return false;
++        }
++        if (s->vwire_supported) {
++            if (!odp_espi_configuration(s, ODP_ESPI_CONFIG_CH1,
++                                        &value, false, deadline)) {
++                return false;
++            }
++            supported = 1 + ((value &
++                              ODP_ESPI_CH1_MAX_COUNT_SUPPORTED_MASK) >>
++                             ODP_ESPI_CH1_MAX_COUNT_SUPPORTED_SHIFT);
++            if (supported < ODP_ESPI_VWIRE_MIN_COUNT) {
++                odp_espi_disconnect(s, ESPI_ERROR_PROTOCOL);
++                return false;
++            }
++            s->vwire_limit = ODP_ESPI_VWIRE_MIN_COUNT;
++            value &= ~ODP_ESPI_CH1_MAX_COUNT_SELECTED_MASK;
++            value |= ODP_ESPI_CH1_ENABLE |
++                     ((s->vwire_limit - 1) <<
++                      ODP_ESPI_CH1_MAX_COUNT_SELECTED_SHIFT);
++            if (!odp_espi_configuration(s, ODP_ESPI_CONFIG_CH1,
++                                        &value, true, deadline)) {
++                return false;
++            }
++        }
++        s->configured = true;
++    }
++    if (!s->ready) {
++        if (!odp_espi_configuration(s, ODP_ESPI_CONFIG_CH0,
++                                    &value, false, deadline)) {
++            return false;
++        }
++        ready = (value & (ODP_ESPI_CH0_ENABLE | ODP_ESPI_CH0_READY)) ==
++            (ODP_ESPI_CH0_ENABLE | ODP_ESPI_CH0_READY);
++        if (s->vwire_supported) {
++            if (!odp_espi_configuration(s, ODP_ESPI_CONFIG_CH1,
++                                        &value, false, deadline)) {
++                return false;
++            }
++            s->vwire_ready =
++                (value & (ODP_ESPI_CH1_ENABLE | ODP_ESPI_CH1_READY)) ==
++                (ODP_ESPI_CH1_ENABLE | ODP_ESPI_CH1_READY);
++            ready &= s->vwire_ready;
++        }
++    }
++    if (ready && !s->ready) {
++        if (s->alert) {
++            s->alert = false;
++            if (!odp_espi_exchange(s, ODP_ESPI_CMD_GET_STATUS,
++                                   NULL, 0, deadline)) {
++                return false;
++            }
++        }
++        if (!odp_espi_drain_vwires(s, deadline)) {
++            return false;
++        }
++    }
++    s->ready = ready;
++    return s->ready;
++}
++
++static int odp_espi_can_receive(void *opaque)
++{
++    OdpESPIControllerState *state = opaque;
++
++    return sizeof(state->rx);
++}
++
++static void odp_espi_receive_vwires(OdpESPIControllerState *state)
++{
++    unsigned count = state->rx[1] + 1;
++    unsigned index;
++
++    for (index = 0; index < count; index++) {
++        uint8_t group = state->rx[2 + index * 2];
++        uint8_t value = state->rx[3 + index * 2];
++
++        if (group <= ODP_ESPI_VWIRE_IRQ_HIGH) {
++            unsigned irq = group * 128 + (value & ODP_ESPI_VWIRE_IRQ_MASK);
++
++            if (irq < ODP_ESPI_IRQ_COUNT) {
++                if (value & ODP_ESPI_VWIRE_IRQ_LEVEL) {
++                    state->irq_level |= 1U << irq;
++                } else {
++                    state->irq_level &= ~(1U << irq);
++                }
++                odp_espi_update_irq(state);
++            }
++        }
++    }
++}
++
++static void odp_espi_receive(void *opaque, const uint8_t *data, int length)
++{
++    OdpESPIControllerState *s = opaque;
++    int index;
++
++    for (index = 0; index < length; index++) {
++        uint8_t byte = data[index];
++
++        if (!s->receiving) {
++            if (byte == ODP_ESPI_WIRE_ALERT) {
++                s->alert = true;
++                qemu_cond_broadcast(&s->cond);
++                odp_espi_schedule_service(s);
++                continue;
++            }
++            if (byte != ODP_ESPI_WIRE_DATA || !s->pending ||
++                !s->expect_response || s->tx_pos != s->tx_size) {
++                goto malformed;
++            }
++            s->receiving = true;
++            continue;
++        }
++        if (!s->rx_size && byte == ODP_ESPI_RSP_WAIT_STATE) {
++            continue;
++        }
++        if (s->rx_size == sizeof(s->rx)) {
++            goto malformed;
++        }
++        s->rx[s->rx_size++] = byte;
++        if (s->rx_size == 1) {
++            if (byte == ODP_ESPI_RSP_NO_RESPONSE || (byte & 0xc0)) {
++                goto malformed;
++            }
++            switch (byte & 0x0f) {
++            case ODP_ESPI_RSP_ACCEPT:
++                if (s->command == ODP_ESPI_CMD_GET_CONFIGURATION) {
++                    s->rx_needed = 8;
++                } else if (s->command == ODP_ESPI_CMD_PUT_NP ||
++                           s->command == ODP_ESPI_CMD_GET_PC ||
++                           s->command == ODP_ESPI_CMD_GET_VWIRE) {
++                    s->rx_needed = 0;
++                } else {
++                    s->rx_needed = 4;
++                }
++                break;
++            case ODP_ESPI_RSP_DEFER:
++                if (s->command != ODP_ESPI_CMD_PUT_NP) {
++                    goto malformed;
++                }
++                s->rx_needed = 4;
++                break;
++            case ODP_ESPI_RSP_NON_FATAL_ERROR:
++            case ODP_ESPI_RSP_FATAL_ERROR:
++                s->rx_needed = 4;
++                break;
++            default:
++                goto malformed;
++            }
++        }
++        if (!s->rx_needed && s->command == ODP_ESPI_CMD_GET_VWIRE &&
++            s->rx_size == 2) {
++            if ((byte & ~ODP_ESPI_VWIRE_COUNT_MASK) ||
++                byte + 1 > s->vwire_limit) {
++                goto malformed;
++            }
++            s->rx_needed = 5 + 2 * (byte + 1);
++        }
++        if (!s->rx_needed && s->rx_size == 4) {
++            unsigned payload = lduw_be_p(s->rx + 2) &
++                               ODP_ESPI_PACKET_LENGTH_MASK;
++
++            if (s->rx[1] == ODP_ESPI_CYCLE_SUCCESS_DATA_ONLY) {
++                if (!payload || payload > ESPI_MAX_PAYLOAD) {
++                    goto malformed;
++                }
++            } else if (s->rx[1] == ODP_ESPI_CYCLE_UNSUCCESSFUL_ONLY) {
++                payload = 0;
++            } else {
++                goto malformed;
++            }
++            s->rx_needed = 7 + payload;
++        }
++        if (s->rx_size != s->rx_needed) {
++            continue;
++        }
++        if (s->crc_enabled && odp_espi_crc8(s->rx, s->rx_size)) {
++            odp_espi_disconnect(s, ESPI_ERROR_CRC);
++            return;
++        }
++        s->target_status = lduw_le_p(s->rx + s->rx_size - 3);
++        if ((s->rx[0] & 0x0f) == ODP_ESPI_RSP_FATAL_ERROR ||
++            (s->rx[0] & 0x0f) == ODP_ESPI_RSP_NON_FATAL_ERROR) {
++            goto malformed;
++        }
++        s->pending = false;
++        s->receiving = false;
++        if (s->command == ODP_ESPI_CMD_GET_VWIRE) {
++            odp_espi_receive_vwires(s);
++        }
++        if (s->target_status & ODP_ESPI_STATUS_VWIRE_AVAIL) {
++            odp_espi_schedule_service(s);
++        }
++        qemu_cond_broadcast(&s->cond);
++    }
++    return;
++
++malformed:
++    odp_espi_disconnect(s, ESPI_ERROR_PROTOCOL);
++}
++
++static bool odp_espi_drain_vwires(OdpESPIControllerState *state,
++                                  int64_t deadline)
++{
++    while (state->vwire_ready &&
++           (state->target_status & ODP_ESPI_STATUS_VWIRE_AVAIL)) {
++        if (odp_espi_now_ms() >= deadline) {
++            odp_espi_disconnect(state, ESPI_ERROR_TIMEOUT);
++            return false;
++        }
++        if (!odp_espi_exchange(state, ODP_ESPI_CMD_GET_VWIRE,
++                               NULL, 0, deadline)) {
++            return false;
++        }
++    }
++    return !state->failed;
++}
++
++static gboolean odp_espi_service(void *opaque)
++{
++    OdpESPIControllerState *s = opaque;
++    int64_t deadline = odp_espi_now_ms() + s->timeout_ms;
++
++    s->service_source = 0;
++    if (!s->connected) {
++        return G_SOURCE_REMOVE;
++    }
++    if (!s->busy) {
++        s->busy = true;
++        s->failed = false;
++        if (odp_espi_prepare(s, deadline) || s->vwire_ready) {
++            if (s->alert) {
++                s->alert = false;
++                odp_espi_exchange(s, ODP_ESPI_CMD_GET_STATUS,
++                                   NULL, 0, deadline);
++            }
++            if (!s->failed) {
++                odp_espi_drain_vwires(s, deadline);
++            }
++        }
++        s->busy = false;
++        qemu_cond_broadcast(&s->cond);
++    }
++    if (!s->busy && s->connected && !s->ready && !s->service_source) {
++        s->service_source = g_timeout_add(10, odp_espi_service, s);
++    }
++    return G_SOURCE_REMOVE;
++}
++
++static void odp_espi_schedule_service(OdpESPIControllerState *s)
++{
++    if (!s->service_source && s->connected) {
++        s->service_source = g_idle_add(odp_espi_service, s);
++    }
++}
++
++static void odp_espi_event(void *opaque, QEMUChrEvent event)
++{
++    OdpESPIControllerState *s = opaque;
++
++    switch (event) {
++    case CHR_EVENT_OPENED:
++        s->connected = true;
++        s->ready = false;
++        s->configured = false;
++        s->reset_needed = true;
++        odp_espi_clear_vwires(s);
++        odp_espi_schedule_service(s);
++        break;
++    case CHR_EVENT_CLOSED:
++        s->connected = false;
++        odp_espi_cancel(s, ESPI_ERROR_LINK);
++        if (s->service_source) {
++            g_source_remove(s->service_source);
++            s->service_source = 0;
++        }
++        break;
++    default:
++        break;
++    }
++}
++
++static void odp_espi_unmap_window(OdpESPIWindow *window)
++{
++    if (window->mapped) {
++        memory_region_del_subregion(get_system_memory(), &window->iomem);
++        window->mapped = false;
++    }
++}
++
++static bool odp_espi_window_valid(OdpESPIWindow *window,
++                                  uint32_t base, uint32_t size)
++{
++    MemoryRegionSection section;
++
++    if (!size || (uint64_t)base + size > (1ULL << 32)) {
++        return false;
++    }
++
++    section = memory_region_find(get_system_memory(), base, size);
++    if (section.mr) {
++        memory_region_unref(section.mr);
++        return false;
++    }
++    return true;
++}
++
++static void odp_espi_map_window(OdpESPIWindow *window)
++{
++    memory_region_set_size(&window->iomem, window->size);
++    memory_region_add_subregion(get_system_memory(), window->base,
++                               &window->iomem);
++    window->mapped = true;
++}
++
++static MemTxResult odp_espi_access(OdpESPIWindow *window, hwaddr offset,
++                                   uint64_t *value, unsigned size, bool write)
++{
++    OdpESPIControllerState *s = window->controller;
++    int64_t deadline = odp_espi_now_ms() + s->timeout_ms;
++    uint8_t request[7 + 4];
++    unsigned index;
++    uint16_t free_bit = write ? ODP_ESPI_STATUS_PC_FREE :
++                               ODP_ESPI_STATUS_NP_FREE;
++    MemTxResult result = MEMTX_ERROR;
++
++    while (s->busy) {
++        if (!qemu_in_vcpu_thread() || !odp_espi_wait(s, deadline)) {
++            *value = UINT64_MAX;
++            return MEMTX_ERROR;
++        }
++    }
++    s->busy = true;
++    s->failed = false;
++    if (!s->connected) {
++        odp_espi_set_error(s, ESPI_ERROR_LINK);
++        goto out;
++    }
++    if (!window->enabled || offset + size > window->size ||
++        !odp_espi_prepare(s, deadline) ||
++        !odp_espi_drain_vwires(s, deadline)) {
++        goto out;
++    }
++    while (!(s->target_status & free_bit)) {
++        if (!odp_espi_exchange(s, ODP_ESPI_CMD_GET_STATUS, NULL, 0, deadline) ||
++            !odp_espi_drain_vwires(s, deadline) ||
++            (!(s->target_status & free_bit) && !odp_espi_wait(s, deadline))) {
++            goto out;
++        }
++    }
++    if (!write) {
++        s->tag = (s->tag + 1) & 0x0f;
++    }
++    request[0] = write ? ODP_ESPI_CYCLE_MEM_WRITE32 :
++                         ODP_ESPI_CYCLE_MEM_READ32;
++    stw_be_p(request + 1, (s->tag << 12) | size);
++    stl_be_p(request + 3, window->base + offset);
++    for (index = 0; write && index < size; index++) {
++        request[7 + index] = *value >> (index * 8);
++    }
++    if (!odp_espi_exchange(s, write ? ODP_ESPI_CMD_PUT_PC :
++                                     ODP_ESPI_CMD_PUT_NP,
++                           request, 7 + (write ? size : 0), deadline)) {
++        goto out;
++    }
++    if (write) {
++        result = MEMTX_OK;
++        goto out;
++    }
++    if ((s->rx[0] & 0x0f) == ODP_ESPI_RSP_DEFER) {
++        while (!(s->target_status & ODP_ESPI_STATUS_PC_AVAIL)) {
++            if (!odp_espi_exchange(s, ODP_ESPI_CMD_GET_STATUS,
++                                   NULL, 0, deadline) ||
++                !odp_espi_drain_vwires(s, deadline) ||
++                (!(s->target_status & ODP_ESPI_STATUS_PC_AVAIL) &&
++                 !odp_espi_wait(s, deadline))) {
++                goto out;
++            }
++        }
++        if (!odp_espi_exchange(s, ODP_ESPI_CMD_GET_PC, NULL, 0, deadline)) {
++            goto out;
++        }
++    }
++    if ((s->rx[2] >> ODP_ESPI_PACKET_TAG_SHIFT) != s->tag) {
++        odp_espi_disconnect(s, ESPI_ERROR_PROTOCOL);
++        goto out;
++    }
++    if (s->rx[1] == ODP_ESPI_CYCLE_UNSUCCESSFUL_ONLY) {
++        odp_espi_set_error(s, ESPI_ERROR_COMPLETION);
++        goto out;
++    }
++    if (s->rx_size != size + 7) {
++        odp_espi_disconnect(s, ESPI_ERROR_PROTOCOL);
++        goto out;
++    }
++    *value = 0;
++    for (index = 0; index < size; index++) {
++        *value |= (uint64_t)s->rx[4 + index] << (index * 8);
++    }
++    result = MEMTX_OK;
++
++out:
++    if (result == MEMTX_OK && !odp_espi_drain_vwires(s, deadline)) {
++        result = MEMTX_ERROR;
++    }
++    s->busy = false;
++    if (result != MEMTX_OK) {
++        *value = UINT64_MAX;
++    }
++    qemu_cond_broadcast(&s->cond);
++    if (s->alert || (s->target_status & ODP_ESPI_STATUS_VWIRE_AVAIL)) {
++        odp_espi_schedule_service(s);
++    }
++    return result;
++}
++
++static MemTxResult odp_espi_window_read(void *opaque, hwaddr offset,
++                                       uint64_t *value, unsigned size,
++                                       MemTxAttrs attrs)
++{
++    return odp_espi_access(opaque, offset, value, size, false);
++}
++
++static MemTxResult odp_espi_window_write(void *opaque, hwaddr offset,
++                                        uint64_t value, unsigned size,
++                                        MemTxAttrs attrs)
++{
++    return odp_espi_access(opaque, offset, &value, size, true);
++}
++
++static bool odp_espi_window_accepts(void *opaque, hwaddr offset,
++                                    unsigned size, bool write, MemTxAttrs attrs)
++{
++    OdpESPIWindow *window = opaque;
++    bool valid = size >= 1 && size <= 8 && !(offset & (size - 1));
++
++    if (window == &window->controller->windows[ESPI_DATA_WINDOW_COUNT]) {
++        hwaddr reg = offset % ODP_ESPI_CONTROL_STRIDE;
++
++        valid = valid && size == 4 &&
++            offset < ESPI_DATA_WINDOW_COUNT * ODP_ESPI_CONTROL_STRIDE &&
++                (reg == ESPI_CONTROL_STATUS ||
++                 reg == ESPI_CONTROL_DOORBELL ||
++                 reg == ESPI_CONTROL_IRQ_ACK);
++    }
++    return valid;
++}
++
++static const MemoryRegionOps odp_espi_window_ops = {
++    .read_with_attrs = odp_espi_window_read,
++    .write_with_attrs = odp_espi_window_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 1, .max_access_size = 8,
++               .accepts = odp_espi_window_accepts },
++    .impl = { .min_access_size = 1, .max_access_size = 4 },
++};
++
++static void odp_espi_reset_hold(Object *obj, ResetType type)
++{
++    OdpESPIControllerState *s = ODP_ESPI_CONTROLLER(obj);
++    unsigned index;
++
++    if (s->busy) {
++        odp_espi_disconnect(s, ESPI_ERROR_PROTOCOL);
++    }
++    for (index = 0; index < ESPI_WINDOW_COUNT; index++) {
++        odp_espi_unmap_window(&s->windows[index]);
++    }
++    s->errors = 0;
++    odp_espi_clear_vwires(s);
++    s->ready = false;
++    s->configured = false;
++    s->reset_needed = true;
++    s->tag = 0;
++    s->target_status = 0;
++    s->alert = false;
++    for (index = 0; index < ESPI_WINDOW_COUNT; index++) {
++        OdpESPIWindow *window = &s->windows[index];
++
++        window->base = index == ESPI_DATA_WINDOW_COUNT ?
++                       ODP_ESPI_CONTROL_BASE :
++                       ODP_ESPI_SHARED_BASE + index * ODP_ESPI_SHARED_STRIDE;
++        window->size = ESPI_WINDOW_SIZE;
++        window->enabled = odp_espi_window_valid(window, window->base,
++                                                window->size);
++        if (window->enabled) {
++            odp_espi_map_window(window);
++        } else {
++            odp_espi_set_error(s, ESPI_ERROR_WINDOW);
++        }
++    }
++    odp_espi_schedule_service(s);
++}
++
++static void odp_espi_controller_init(Object *obj)
++{
++    OdpESPIControllerState *s = ODP_ESPI_CONTROLLER(obj);
++    unsigned index;
++
++    for (index = 0; index < ODP_ESPI_IRQ_COUNT; index++) {
++        sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq[index]);
++    }
++    for (index = 0; index < ESPI_WINDOW_COUNT; index++) {
++        OdpESPIWindow *window = &s->windows[index];
++
++        window->controller = s;
++        memory_region_init_io(&window->iomem, obj, &odp_espi_window_ops,
++                              window, "odp-espi-window", ESPI_WINDOW_SIZE);
++        window->iomem.disable_reentrancy_guard = true;
++    }
++}
++
++static void odp_espi_controller_realize(DeviceState *dev, Error **errp)
++{
++    OdpESPIControllerState *s = ODP_ESPI_CONTROLLER(dev);
++
++    if (!s->timeout_ms || s->timeout_ms > INT_MAX) {
++        error_setg(errp, "eSPI timeout-ms must be between 1 and %d", INT_MAX);
++        return;
++    }
++    qemu_cond_init(&s->cond);
++    odp_espi_reset_hold(OBJECT(dev), RESET_TYPE_COLD);
++    qemu_chr_fe_set_handlers(&s->chr, odp_espi_can_receive, odp_espi_receive,
++                             odp_espi_event, NULL, s, NULL, true);
++}
++
++static void odp_espi_controller_unrealize(DeviceState *dev)
++{
++    OdpESPIControllerState *s = ODP_ESPI_CONTROLLER(dev);
++    unsigned index;
++
++    qemu_chr_fe_set_handlers(&s->chr, NULL, NULL, NULL, NULL, NULL,
++                             NULL, false);
++    if (s->service_source) {
++        g_source_remove(s->service_source);
++    }
++    if (s->write_watch) {
++        g_source_remove(s->write_watch);
++    }
++    for (index = 0; index < ESPI_WINDOW_COUNT; index++) {
++        odp_espi_unmap_window(&s->windows[index]);
++    }
++    qemu_cond_destroy(&s->cond);
++}
++
++static const Property odp_espi_controller_properties[] = {
++    DEFINE_PROP_CHR("chardev", OdpESPIControllerState, chr),
++    DEFINE_PROP_UINT32("timeout-ms", OdpESPIControllerState, timeout_ms, 1000),
++};
++
++static const VMStateDescription odp_espi_vmstate = {
++    .name = TYPE_ODP_ESPI_CONTROLLER,
++    .unmigratable = true,
++};
++
++static void odp_espi_controller_class_init(ObjectClass *oc, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    ResettableClass *rc = RESETTABLE_CLASS(oc);
++
++    dc->desc = "ODP socket-backed eSPI controller";
++    dc->realize = odp_espi_controller_realize;
++    dc->unrealize = odp_espi_controller_unrealize;
++    dc->vmsd = &odp_espi_vmstate;
++    dc->hotpluggable = false;
++    rc->phases.hold = odp_espi_reset_hold;
++    device_class_set_props(dc, odp_espi_controller_properties);
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++}
++
++static const TypeInfo odp_espi_controller_info = {
++    .name          = TYPE_ODP_ESPI_CONTROLLER,
++    .parent        = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(OdpESPIControllerState),
++    .instance_init = odp_espi_controller_init,
++    .class_init    = odp_espi_controller_class_init,
++};
++
++static void odp_espi_controller_register_types(void)
++{
++    type_register_static(&odp_espi_controller_info);
++}
++
++type_init(odp_espi_controller_register_types)
+diff --git a/hw/odp/espi-target.c b/hw/odp/espi-target.c
+new file mode 100644
+index 0000000000..fc3d4df4b1
+--- /dev/null
++++ b/hw/odp/espi-target.c
+@@ -0,0 +1,1074 @@
++#include "qemu/osdep.h"
++#include "qemu/bswap.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "qapi/error.h"
++#include "chardev/char-fe.h"
++#include "hw/irq.h"
++#include "hw/odp/espi-proto.h"
++#include "hw/odp/espi-target.h"
++#include "hw/qdev-properties.h"
++#include "hw/qdev-properties-system.h"
++#include "migration/vmstate.h"
++
++#define ESPI_REG_CONTROL         0x00
++#define ESPI_REG_MAILBOX0_ADDR   0x04
++#define ESPI_REG_MAILBOX1_ADDR   0x08
++#define ESPI_REG_CONTROL_ADDR    0x0c
++#define ESPI_REG_MAILBOX_CONTROL 0x10
++#define ESPI_REG_MAILBOX_STRIDE  0x0c
++#define ESPI_REG_SIZE            0x1000
++#define ESPI_MAILBOX_COUNT       2
++#define ESPI_MAILBOX_SIZE        4096
++#define ESPI_MAX_PAYLOAD         64
++#define ESPI_MAILBOX_CONTROL_SIZE 0x1000
++#define ESPI_MAILBOX_CONTROL_STRIDE 0x20
++#define ESPI_MAILBOX_SHARED_STATUS 0x00
++#define ESPI_MAILBOX_DOORBELL      0x04
++#define ESPI_MAILBOX_IRQ_SET       0x08
++#define ESPI_MAILBOX_IRQ_ACK       0x0c
++
++#define ESPI_CONTROL_ENABLE     (1U << 0)
++#define ESPI_ERROR_CRC          (1U << 0)
++#define ESPI_ERROR_PROTOCOL     (1U << 1)
++#define ESPI_ERROR_ADDRESS      (1U << 2)
++#define ESPI_ERROR_PERMISSION   (1U << 3)
++#define ESPI_ERROR_LINK         (1U << 4)
++#define ESPI_ERROR_CONFIG       (1U << 5)
++#define ESPI_ERROR_ABORT        (1U << 6)
++#define ESPI_ERROR_LENGTH       (1U << 7)
++#define ESPI_ERROR_UNSUPPORTED  (1U << 8)
++#define ESPI_ERROR_BUSY         (1U << 9)
++#define ESPI_ERROR_TIMEOUT      (1U << 10)
++#define ESPI_CH0_RESET          (ODP_ESPI_CH0_ENABLE | (1U << 4) | \
++                                (1U << 8) | (1U << 12))
++#define ESPI_VWIRE_COUNT        ODP_ESPI_VWIRE_MIN_COUNT
++#define ESPI_VWIRE_QUEUE_SIZE   64
++#define ESPI_HOST_IRQ_MASK      ((1U << ESPI_MAILBOX_COUNT) - 1)
++#define ESPI_CH1_RESET          ((ESPI_VWIRE_COUNT - 1) << \
++                                ODP_ESPI_CH1_MAX_COUNT_SUPPORTED_SHIFT)
++#define ESPI_STATUS_FIXED_FREE  (ODP_ESPI_STATUS_VWIRE_FREE | (1U << 8))
++#define ESPI_GENERAL_SUPPORTED  (ODP_ESPI_GENERAL_CHANNEL0_SUPPORTED | \
++                                ODP_ESPI_GENERAL_CHANNEL1_SUPPORTED)
++#define ESPI_GENERAL_WRITABLE   (ODP_ESPI_GENERAL_CRC_ENABLE | \
++                                (1U << 28) | (0xfU << 12))
++#define ESPI_GENERAL_UNSUPPORTED ((1U << 30) | (3U << 26) | \
++                                  (1U << 23) | (7U << 20))
++
++typedef enum OdpESPITargetRxState {
++    ESPI_RX_KIND,
++    ESPI_RX_DATA,
++    ESPI_RX_RESET,
++} OdpESPITargetRxState;
++
++typedef struct OdpESPIMailbox {
++    MemoryRegion iomem;
++    uint8_t data[ESPI_MAILBOX_SIZE];
++    uint32_t base;
++    uint32_t shared_status;
++    bool doorbell;
++} OdpESPIMailbox;
++
++struct OdpESPITargetState {
++    SysBusDevice parent_obj;
++    CharBackend chr;
++    MemoryRegion iomem;
++    qemu_irq irq;
++    OdpESPIMailbox mailboxes[ESPI_MAILBOX_COUNT];
++    uint32_t control;
++    uint32_t errors;
++    uint32_t general;
++    uint32_t channel;
++    uint32_t vwire_channel;
++    uint32_t host_irq;
++    uint32_t mailbox_control_base;
++    uint8_t vwire_queue[ESPI_VWIRE_QUEUE_SIZE][ODP_ESPI_VWIRE_GROUP_SIZE];
++    unsigned vwire_head;
++    unsigned vwire_count;
++    unsigned tx_vwire_count;
++    bool connected;
++    bool external_reset;
++    OdpESPITargetRxState rx_state;
++    uint8_t rx[ODP_ESPI_PACKET_LENGTH_MAX + 9];
++    unsigned rx_size;
++    unsigned rx_needed;
++    uint8_t tx[ESPI_MAX_PAYLOAD + 8];
++    unsigned tx_size;
++    unsigned tx_pos;
++    uint16_t config_address;
++    uint32_t config_value;
++    uint16_t reported_status;
++    uint16_t alerted_status;
++    guint write_watch;
++    QEMUTimer *timer;
++    uint32_t timeout_ms;
++};
++
++static void odp_espit_alert(OdpESPITargetState *s);
++
++static uint32_t odp_espit_irq_status(OdpESPITargetState *s)
++{
++    uint32_t status = 0;
++    unsigned index;
++
++    for (index = 0; index < ESPI_MAILBOX_COUNT; index++) {
++        if (s->mailboxes[index].doorbell) {
++            status |= 1U << index;
++        }
++    }
++    return status;
++}
++
++static void odp_espit_update_irq(OdpESPITargetState *s)
++{
++    qemu_set_irq(s->irq, odp_espit_irq_status(s) != 0);
++}
++
++static void odp_espit_set_error(OdpESPITargetState *s, uint32_t error)
++{
++    s->errors |= error;
++}
++
++static uint8_t odp_espit_crc8(const uint8_t *data, unsigned length)
++{
++    uint8_t crc = ODP_ESPI_CRC8_INIT;
++    unsigned index, bit;
++
++    for (index = 0; index < length; index++) {
++        crc ^= data[index];
++        for (bit = 0; bit < 8; bit++) {
++            crc = (crc << 1) ^ ((crc & 0x80) ? ODP_ESPI_CRC8_POLYNOMIAL : 0);
++        }
++    }
++    return crc;
++}
++
++static bool odp_espit_pending(OdpESPITargetState *s)
++{
++    return s->rx_state != ESPI_RX_KIND || s->tx_size;
++}
++
++static void odp_espit_clear_io(OdpESPITargetState *s)
++{
++    if (s->write_watch) {
++        g_source_remove(s->write_watch);
++        s->write_watch = 0;
++    }
++    timer_del(s->timer);
++    s->rx_state = ESPI_RX_KIND;
++    s->rx_size = 0;
++    s->rx_needed = 0;
++    s->tx_size = 0;
++    s->tx_pos = 0;
++    s->vwire_head = 0;
++    s->vwire_count = 0;
++    s->tx_vwire_count = 0;
++    s->config_address = 0;
++    s->reported_status = ESPI_STATUS_FIXED_FREE;
++    s->alerted_status = ESPI_STATUS_FIXED_FREE;
++}
++
++static void odp_espit_disconnect(OdpESPITargetState *s, uint32_t error)
++{
++    odp_espit_set_error(s, error |
++                       (odp_espit_pending(s) ? ESPI_ERROR_ABORT : 0));
++    odp_espit_clear_io(s);
++    qemu_chr_fe_disconnect(&s->chr);
++}
++
++static void odp_espit_timeout(void *opaque)
++{
++    odp_espit_disconnect(opaque, ESPI_ERROR_TIMEOUT);
++}
++
++static void odp_espit_arm_timer(OdpESPITargetState *s)
++{
++    timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + s->timeout_ms);
++}
++
++static bool odp_espit_ready(OdpESPITargetState *s)
++{
++    return s->connected && !s->external_reset &&
++           (s->control & ESPI_CONTROL_ENABLE) &&
++           (s->channel & ODP_ESPI_CH0_ENABLE);
++}
++
++static uint32_t odp_espit_channel(OdpESPITargetState *s)
++{
++    return s->channel | (odp_espit_ready(s) ? ODP_ESPI_CH0_READY : 0);
++}
++
++static bool odp_espit_vwire_ready(OdpESPITargetState *state)
++{
++    return state->connected && !state->external_reset &&
++           (state->vwire_channel & ODP_ESPI_CH1_ENABLE);
++}
++
++static uint32_t odp_espit_vwire_channel(OdpESPITargetState *state)
++{
++    return state->vwire_channel |
++           (odp_espit_vwire_ready(state) ? ODP_ESPI_CH1_READY : 0);
++}
++
++static void odp_espit_queue_vwire(OdpESPITargetState *state, uint8_t index,
++                                  uint8_t value)
++{
++    unsigned tail;
++
++    if (!odp_espit_vwire_ready(state)) {
++        return;
++    }
++    if (state->vwire_count == ESPI_VWIRE_QUEUE_SIZE) {
++        odp_espit_disconnect(state, ESPI_ERROR_BUSY);
++        return;
++    }
++    tail = (state->vwire_head + state->vwire_count) % ESPI_VWIRE_QUEUE_SIZE;
++    state->vwire_queue[tail][0] = index;
++    state->vwire_queue[tail][1] = value;
++    state->vwire_count++;
++}
++
++static void odp_espit_host_irq(OdpESPITargetState *state, uint32_t pending)
++{
++    uint32_t previous = state->host_irq;
++    unsigned index;
++
++    state->host_irq = pending & ESPI_HOST_IRQ_MASK;
++    for (index = 0; index < ESPI_MAILBOX_COUNT; index++) {
++        if ((previous ^ state->host_irq) & (1U << index)) {
++            odp_espit_queue_vwire(state, ODP_ESPI_VWIRE_IRQ_LOW,
++                                  index | ((state->host_irq & (1U << index)) ?
++                                           ODP_ESPI_VWIRE_IRQ_LEVEL : 0));
++        }
++    }
++}
++
++static void odp_espit_sync_vwires(OdpESPITargetState *state)
++{
++    unsigned index;
++
++    state->vwire_head = 0;
++    state->vwire_count = 0;
++    for (index = 0; index < ESPI_MAILBOX_COUNT; index++) {
++        odp_espit_queue_vwire(state, ODP_ESPI_VWIRE_IRQ_LOW,
++                              index | ((state->host_irq &
++                                        (1U << index)) ?
++                                       ODP_ESPI_VWIRE_IRQ_LEVEL : 0));
++    }
++}
++
++static uint16_t odp_espit_bus_status(OdpESPITargetState *s)
++{
++    return ESPI_STATUS_FIXED_FREE |
++           (odp_espit_ready(s) ? ODP_ESPI_STATUS_PC_FREE |
++                                 ODP_ESPI_STATUS_NP_FREE : 0) |
++           (odp_espit_vwire_ready(s) && s->vwire_count > s->tx_vwire_count ?
++            ODP_ESPI_STATUS_VWIRE_AVAIL : 0);
++}
++
++static void odp_espit_reset_hold(Object *obj, ResetType type)
++{
++    OdpESPITargetState *s = ODP_ESPI_TARGET(obj);
++    bool aborted = odp_espit_pending(s);
++    unsigned index;
++
++    odp_espit_clear_io(s);
++    if (s->connected) {
++        qemu_chr_fe_disconnect(&s->chr);
++    }
++    s->control = 0;
++    s->errors = aborted ? ESPI_ERROR_ABORT : 0;
++    s->general = ESPI_GENERAL_SUPPORTED;
++    s->channel = ESPI_CH0_RESET;
++    s->vwire_channel = ESPI_CH1_RESET;
++    s->host_irq = 0;
++    s->mailbox_control_base = 0;
++    for (index = 0; index < ESPI_MAILBOX_COUNT; index++) {
++        OdpESPIMailbox *mailbox = &s->mailboxes[index];
++
++        mailbox->base = 0;
++        mailbox->shared_status = 0;
++        mailbox->doorbell = false;
++        memset(mailbox->data, 0, sizeof(mailbox->data));
++    }
++    odp_espit_update_irq(s);
++}
++
++static gboolean odp_espit_writable(void *unused, GIOCondition condition,
++                                    void *opaque);
++
++static void odp_espit_flush(OdpESPITargetState *s)
++{
++    int written;
++
++    written = qemu_chr_fe_write(&s->chr, s->tx + s->tx_pos,
++                                s->tx_size - s->tx_pos);
++    if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
++        odp_espit_disconnect(s, ESPI_ERROR_LINK);
++        return;
++    }
++    if (written > 0) {
++        s->tx_pos += written;
++    }
++    if (s->tx_pos < s->tx_size) {
++        s->write_watch = qemu_chr_fe_add_watch(&s->chr, G_IO_OUT | G_IO_HUP,
++                                               odp_espit_writable, s);
++        if (!s->write_watch) {
++            odp_espit_disconnect(s, ESPI_ERROR_LINK);
++        }
++        return;
++    }
++    s->tx_size = 0;
++    s->tx_pos = 0;
++    timer_del(s->timer);
++    s->vwire_head = (s->vwire_head + s->tx_vwire_count) %
++                    ESPI_VWIRE_QUEUE_SIZE;
++    s->vwire_count -= s->tx_vwire_count;
++    s->tx_vwire_count = 0;
++    if (s->config_address == ODP_ESPI_CONFIG_GENERAL) {
++        s->general = s->config_value;
++    } else if (s->config_address == ODP_ESPI_CONFIG_CH0) {
++        s->channel = s->config_value;
++    } else if (s->config_address == ODP_ESPI_CONFIG_CH1) {
++        bool enabled = !(s->vwire_channel & ODP_ESPI_CH1_ENABLE) &&
++                       (s->config_value & ODP_ESPI_CH1_ENABLE);
++
++        s->vwire_channel = s->config_value;
++        if (enabled) {
++            odp_espit_sync_vwires(s);
++        }
++    }
++    s->config_address = 0;
++    odp_espit_update_irq(s);
++    odp_espit_alert(s);
++    qemu_chr_fe_accept_input(&s->chr);
++}
++
++static gboolean odp_espit_writable(void *unused, GIOCondition condition,
++                                    void *opaque)
++{
++    OdpESPITargetState *s = opaque;
++
++    s->write_watch = 0;
++    if (condition & G_IO_HUP) {
++        odp_espit_disconnect(s, ESPI_ERROR_LINK);
++    } else {
++        odp_espit_flush(s);
++    }
++    return G_SOURCE_REMOVE;
++}
++
++static void odp_espit_alert(OdpESPITargetState *s)
++{
++    uint16_t status = odp_espit_bus_status(s);
++
++    if (!s->connected || s->external_reset || s->tx_size ||
++        s->rx_state != ESPI_RX_KIND ||
++        status == s->reported_status || status == s->alerted_status) {
++        return;
++    }
++    s->alerted_status = status;
++    s->tx[0] = ODP_ESPI_WIRE_ALERT;
++    s->tx_size = 1;
++    s->tx_pos = 0;
++    odp_espit_arm_timer(s);
++    odp_espit_flush(s);
++}
++
++static void odp_espit_reply(OdpESPITargetState *s, uint8_t response,
++                             const uint8_t *payload, unsigned length)
++{
++    uint16_t status = odp_espit_bus_status(s);
++
++    s->tx[0] = ODP_ESPI_WIRE_DATA;
++    s->tx[1] = response;
++    if (length) {
++        memcpy(s->tx + 2, payload, length);
++    }
++    stw_le_p(s->tx + 2 + length, status);
++    s->tx[4 + length] = odp_espit_crc8(s->tx + 1, length + 3);
++    s->tx_size = length + 5;
++    s->tx_pos = 0;
++    s->reported_status = status;
++    s->alerted_status = status;
++    odp_espit_arm_timer(s);
++    odp_espit_flush(s);
++}
++
++static void odp_espit_reject(OdpESPITargetState *s, uint32_t error)
++{
++    odp_espit_set_error(s, error);
++    odp_espit_reply(s, ODP_ESPI_RSP_FATAL_ERROR, NULL, 0);
++}
++
++static void odp_espit_configuration(OdpESPITargetState *s)
++{
++    uint16_t address = lduw_be_p(s->rx + 1) & 0x0ffc;
++    uint32_t value = 0;
++    uint8_t data[4];
++
++    if (s->rx[0] == ODP_ESPI_CMD_GET_CONFIGURATION) {
++        switch (address) {
++        case ODP_ESPI_CONFIG_DEVICE_ID:
++            value = ODP_ESPI_DEVICE_ID_VERSION;
++            break;
++        case ODP_ESPI_CONFIG_GENERAL:
++            value = s->general;
++            break;
++        case ODP_ESPI_CONFIG_CH0:
++            value = odp_espit_channel(s);
++            break;
++        case ODP_ESPI_CONFIG_CH1:
++            value = odp_espit_vwire_channel(s);
++            break;
++        }
++        stl_le_p(data, value);
++        odp_espit_reply(s, ODP_ESPI_RSP_ACCEPT, data, sizeof(data));
++        return;
++    }
++    value = ldl_le_p(s->rx + 3);
++    switch (address) {
++    case ODP_ESPI_CONFIG_GENERAL:
++        if (value & ESPI_GENERAL_UNSUPPORTED) {
++            odp_espit_reject(s, ESPI_ERROR_CONFIG);
++            return;
++        }
++        s->config_address = address;
++        s->config_value = ESPI_GENERAL_SUPPORTED |
++                          (value & ESPI_GENERAL_WRITABLE);
++        break;
++    case ODP_ESPI_CONFIG_CH0:
++        if ((value & ODP_ESPI_CH0_BUS_MASTER_ENABLE) ||
++            ((value & ODP_ESPI_CH0_MAX_PAYLOAD_SELECTED_MASK) >>
++             ODP_ESPI_CH0_MAX_PAYLOAD_SELECTED_SHIFT) !=
++             ODP_ESPI_SIZE_64B_CODE ||
++            ((value & ODP_ESPI_CH0_MAX_READ_REQUEST_MASK) >>
++             ODP_ESPI_CH0_MAX_READ_REQUEST_SHIFT) != ODP_ESPI_SIZE_64B_CODE) {
++            odp_espit_reject(s, ESPI_ERROR_CONFIG);
++            return;
++        }
++        s->config_address = address;
++        s->config_value = (ESPI_CH0_RESET & ~ODP_ESPI_CH0_ENABLE) |
++                          (value & ODP_ESPI_CH0_ENABLE);
++        break;
++    case ODP_ESPI_CONFIG_CH1:
++        if (((value & ODP_ESPI_CH1_MAX_COUNT_SELECTED_MASK) >>
++             ODP_ESPI_CH1_MAX_COUNT_SELECTED_SHIFT) >= ESPI_VWIRE_COUNT) {
++            odp_espit_reject(s, ESPI_ERROR_CONFIG);
++            return;
++        }
++        s->config_address = address;
++        s->config_value = ESPI_CH1_RESET |
++                          (value & (ODP_ESPI_CH1_ENABLE |
++                                    ODP_ESPI_CH1_MAX_COUNT_SELECTED_MASK));
++        break;
++    }
++    odp_espit_reply(s, ODP_ESPI_RSP_ACCEPT, NULL, 0);
++}
++
++static uint32_t odp_espit_control_read(OdpESPITargetState *state,
++                                      hwaddr offset)
++{
++    unsigned index = offset / ESPI_MAILBOX_CONTROL_STRIDE;
++    OdpESPIMailbox *mailbox;
++
++    if (index >= ESPI_MAILBOX_COUNT) {
++        return 0;
++    }
++    mailbox = &state->mailboxes[index];
++    switch (offset % ESPI_MAILBOX_CONTROL_STRIDE) {
++    case ESPI_MAILBOX_SHARED_STATUS:
++        return mailbox->shared_status;
++    case ESPI_MAILBOX_DOORBELL:
++        return mailbox->doorbell;
++    case ESPI_MAILBOX_IRQ_SET:
++    case ESPI_MAILBOX_IRQ_ACK:
++        return (state->host_irq >> index) & 1;
++    }
++    return 0;
++}
++
++static void odp_espit_control_write(OdpESPITargetState *state, hwaddr offset,
++                                    uint32_t value, bool host)
++{
++    unsigned index = offset / ESPI_MAILBOX_CONTROL_STRIDE;
++    uint32_t mask;
++    OdpESPIMailbox *mailbox;
++
++    if (index >= ESPI_MAILBOX_COUNT) {
++        return;
++    }
++    mask = 1U << index;
++    mailbox = &state->mailboxes[index];
++    switch (offset % ESPI_MAILBOX_CONTROL_STRIDE) {
++    case ESPI_MAILBOX_SHARED_STATUS:
++        mailbox->shared_status = value;
++        break;
++    case ESPI_MAILBOX_DOORBELL:
++        if (value & 1) {
++            mailbox->doorbell = host;
++        }
++        break;
++    case ESPI_MAILBOX_IRQ_SET:
++        if (!host && (value & 1)) {
++            odp_espit_host_irq(state, state->host_irq | mask);
++        }
++        break;
++    case ESPI_MAILBOX_IRQ_ACK:
++        if (value & 1) {
++            odp_espit_host_irq(state, state->host_irq & ~mask);
++        }
++        break;
++    }
++    odp_espit_update_irq(state);
++}
++
++static void odp_espit_memory_request(OdpESPITargetState *s)
++{
++    bool write = s->rx[1] == ODP_ESPI_CYCLE_MEM_WRITE32;
++    uint16_t tag_length = lduw_be_p(s->rx + 2);
++    unsigned length = tag_length & ODP_ESPI_PACKET_LENGTH_MASK;
++    uint32_t address = ldl_be_p(s->rx + 4);
++    OdpESPIMailbox *mailbox = NULL;
++    uint8_t completion[3 + ESPI_MAX_PAYLOAD];
++    unsigned index;
++    uint32_t offset, reg;
++
++    if (write != (s->rx[0] == ODP_ESPI_CMD_PUT_PC)) {
++        odp_espit_reject(s, ESPI_ERROR_PERMISSION | ESPI_ERROR_PROTOCOL);
++        return;
++    }
++    if (!odp_espit_ready(s)) {
++        odp_espit_reject(s, ESPI_ERROR_BUSY);
++        return;
++    }
++    if (!length || length > ESPI_MAX_PAYLOAD ||
++        (address & (ESPI_MAX_PAYLOAD - 1)) + length > ESPI_MAX_PAYLOAD) {
++        odp_espit_reject(s, ESPI_ERROR_LENGTH);
++        return;
++    }
++    if (address >= s->mailbox_control_base &&
++        (uint64_t)address < (uint64_t)s->mailbox_control_base +
++                            ESPI_MAILBOX_CONTROL_SIZE) {
++        offset = address - s->mailbox_control_base;
++        reg = offset % ESPI_MAILBOX_CONTROL_STRIDE;
++        if (length != 4 || (address & 3)) {
++            odp_espit_set_error(s, ESPI_ERROR_LENGTH);
++            goto unsuccessful;
++        }
++        if (offset >= ESPI_MAILBOX_COUNT * ESPI_MAILBOX_CONTROL_STRIDE ||
++            (reg != ESPI_MAILBOX_SHARED_STATUS &&
++             reg != ESPI_MAILBOX_DOORBELL && reg != ESPI_MAILBOX_IRQ_ACK)) {
++            odp_espit_set_error(s, ESPI_ERROR_ADDRESS);
++            goto unsuccessful;
++        }
++        if (write) {
++            odp_espit_control_write(s, offset, ldl_le_p(s->rx + 8), true);
++        } else {
++            completion[0] = ODP_ESPI_CYCLE_SUCCESS_DATA_ONLY;
++            stw_be_p(completion + 1, tag_length);
++            stl_le_p(completion + 3, odp_espit_control_read(s, offset));
++        }
++        odp_espit_reply(s, ODP_ESPI_RSP_ACCEPT, completion,
++                        write ? 0 : length + 3);
++        return;
++    }
++    for (index = 0; index < ESPI_MAILBOX_COUNT; index++) {
++        OdpESPIMailbox *candidate = &s->mailboxes[index];
++
++        if (address >= candidate->base &&
++            (uint64_t)address < (uint64_t)candidate->base + ESPI_MAILBOX_SIZE) {
++            mailbox = candidate;
++            break;
++        }
++    }
++    if (!mailbox || (uint64_t)address + length >
++                    (uint64_t)mailbox->base + ESPI_MAILBOX_SIZE) {
++        odp_espit_set_error(s, ESPI_ERROR_ADDRESS);
++        goto unsuccessful;
++    }
++    offset = address - mailbox->base;
++    if (write) {
++        memcpy(mailbox->data + offset, s->rx + 8, length);
++    } else {
++        completion[0] = ODP_ESPI_CYCLE_SUCCESS_DATA_ONLY;
++        stw_be_p(completion + 1, tag_length);
++        memcpy(completion + 3, mailbox->data + offset, length);
++    }
++    odp_espit_reply(s, ODP_ESPI_RSP_ACCEPT, completion,
++                    write ? 0 : length + 3);
++    return;
++
++unsuccessful:
++    if (write) {
++        odp_espit_reply(s, ODP_ESPI_RSP_FATAL_ERROR, NULL, 0);
++    } else {
++        completion[0] = ODP_ESPI_CYCLE_UNSUCCESSFUL_ONLY;
++        stw_be_p(completion + 1, tag_length & 0xf000);
++        odp_espit_reply(s, ODP_ESPI_RSP_ACCEPT, completion, 3);
++    }
++}
++
++static void odp_espit_vwire_request(OdpESPITargetState *state)
++{
++    unsigned limit = 1 + ((state->vwire_channel &
++                          ODP_ESPI_CH1_MAX_COUNT_SELECTED_MASK) >>
++                         ODP_ESPI_CH1_MAX_COUNT_SELECTED_SHIFT);
++    unsigned count, index;
++    uint8_t payload[1 + ESPI_VWIRE_COUNT * ODP_ESPI_VWIRE_GROUP_SIZE];
++
++    if (!odp_espit_vwire_ready(state)) {
++        odp_espit_reject(state, ESPI_ERROR_BUSY);
++        return;
++    }
++    if (state->rx[0] == ODP_ESPI_CMD_PUT_VWIRE) {
++        count = 1 + (state->rx[1] & ODP_ESPI_VWIRE_COUNT_MASK);
++        if ((state->rx[1] & ~ODP_ESPI_VWIRE_COUNT_MASK) || count > limit) {
++            odp_espit_reject(state, ESPI_ERROR_LENGTH);
++            return;
++        }
++        odp_espit_reply(state, ODP_ESPI_RSP_ACCEPT, NULL, 0);
++        return;
++    }
++    if (!state->vwire_count) {
++        odp_espit_reply(state, ODP_ESPI_RSP_NON_FATAL_ERROR, NULL, 0);
++        return;
++    }
++    count = MIN(limit, state->vwire_count);
++    for (index = 0; index < count; index++) {
++        unsigned slot = (state->vwire_head + index) % ESPI_VWIRE_QUEUE_SIZE;
++        unsigned previous, transitions = 0;
++
++        for (previous = 0; previous < index; previous++) {
++            if (payload[1 + previous * 2] == state->vwire_queue[slot][0] &&
++                (state->vwire_queue[slot][0] != ODP_ESPI_VWIRE_IRQ_LOW ||
++                 (payload[2 + previous * 2] & ODP_ESPI_VWIRE_IRQ_MASK) ==
++                 (state->vwire_queue[slot][1] & ODP_ESPI_VWIRE_IRQ_MASK))) {
++                transitions++;
++            }
++        }
++        if (transitions == 2) {
++            break;
++        }
++        memcpy(payload + 1 + index * 2, state->vwire_queue[slot], 2);
++    }
++    state->tx_vwire_count = index;
++    payload[0] = index - 1;
++    odp_espit_reply(state, ODP_ESPI_RSP_ACCEPT, payload, 1 + index * 2);
++}
++
++static void odp_espit_command(OdpESPITargetState *s)
++{
++    if ((s->general & ODP_ESPI_GENERAL_CRC_ENABLE) &&
++        odp_espit_crc8(s->rx, s->rx_size)) {
++        odp_espit_disconnect(s, ESPI_ERROR_CRC);
++        return;
++    }
++    switch (s->rx[0]) {
++    case ODP_ESPI_CMD_GET_CONFIGURATION:
++    case ODP_ESPI_CMD_SET_CONFIGURATION:
++        odp_espit_configuration(s);
++        break;
++    case ODP_ESPI_CMD_GET_STATUS:
++        odp_espit_reply(s, ODP_ESPI_RSP_ACCEPT, NULL, 0);
++        break;
++    case ODP_ESPI_CMD_PUT_PC:
++    case ODP_ESPI_CMD_PUT_NP:
++        odp_espit_memory_request(s);
++        break;
++    case ODP_ESPI_CMD_GET_PC:
++        odp_espit_reject(s, ESPI_ERROR_PROTOCOL);
++        break;
++    case ODP_ESPI_CMD_PUT_VWIRE:
++    case ODP_ESPI_CMD_GET_VWIRE:
++        odp_espit_vwire_request(s);
++        break;
++    }
++}
++
++static void odp_espit_external_reset(OdpESPITargetState *s, bool asserted)
++{
++    bool abort_tx = s->tx_size != 0;
++    unsigned index;
++
++    if (asserted) {
++        odp_espit_set_error(s, abort_tx ? ESPI_ERROR_ABORT : 0);
++        odp_espit_clear_io(s);
++        s->general = ESPI_GENERAL_SUPPORTED;
++        s->channel = ESPI_CH0_RESET;
++        s->vwire_channel = ESPI_CH1_RESET;
++        for (index = 0; index < ESPI_MAILBOX_COUNT; index++) {
++            s->mailboxes[index].doorbell = false;
++        }
++    }
++    s->external_reset = asserted;
++    odp_espit_update_irq(s);
++    if (abort_tx) {
++        odp_espit_disconnect(s, ESPI_ERROR_ABORT);
++    } else {
++        odp_espit_alert(s);
++    }
++}
++
++static int odp_espit_can_receive(void *opaque)
++{
++    OdpESPITargetState *s = opaque;
++
++    return s->tx_size ? 0 : sizeof(s->rx) - s->rx_size;
++}
++
++static void odp_espit_receive(void *opaque, const uint8_t *data, int size)
++{
++    OdpESPITargetState *s = opaque;
++    int index;
++
++    for (index = 0; index < size; index++) {
++        uint8_t byte = data[index];
++
++        if (!s->connected) {
++            return;
++        }
++        if (s->rx_state == ESPI_RX_KIND) {
++            if (byte == ODP_ESPI_WIRE_RESET) {
++                s->rx_state = ESPI_RX_RESET;
++            } else if (byte == ODP_ESPI_WIRE_DATA && !s->external_reset &&
++                       !s->tx_size) {
++                s->rx_state = ESPI_RX_DATA;
++                s->rx_size = 0;
++                s->rx_needed = 0;
++            } else {
++                odp_espit_disconnect(s, ESPI_ERROR_PROTOCOL);
++                return;
++            }
++            odp_espit_arm_timer(s);
++            continue;
++        }
++        if (s->rx_state == ESPI_RX_RESET) {
++            if (byte > ODP_ESPI_WIRE_RESET_ASSERTED) {
++                odp_espit_disconnect(s, ESPI_ERROR_PROTOCOL);
++                return;
++            }
++            s->rx_state = ESPI_RX_KIND;
++            timer_del(s->timer);
++            odp_espit_external_reset(s, byte == ODP_ESPI_WIRE_RESET_ASSERTED);
++            continue;
++        }
++        if (s->rx_size == sizeof(s->rx)) {
++            odp_espit_disconnect(s, ESPI_ERROR_LENGTH);
++            return;
++        }
++        s->rx[s->rx_size++] = byte;
++        if (s->rx_size == 1) {
++            switch (byte) {
++            case ODP_ESPI_CMD_GET_CONFIGURATION:
++                s->rx_needed = 4;
++                break;
++            case ODP_ESPI_CMD_SET_CONFIGURATION:
++                s->rx_needed = 8;
++                break;
++            case ODP_ESPI_CMD_GET_STATUS:
++            case ODP_ESPI_CMD_GET_PC:
++            case ODP_ESPI_CMD_GET_VWIRE:
++                s->rx_needed = 2;
++                break;
++            case ODP_ESPI_CMD_PUT_PC:
++            case ODP_ESPI_CMD_PUT_NP:
++            case ODP_ESPI_CMD_PUT_VWIRE:
++                break;
++            default:
++                odp_espit_disconnect(s, ESPI_ERROR_UNSUPPORTED);
++                return;
++            }
++        }
++        if (s->rx[0] == ODP_ESPI_CMD_PUT_VWIRE && s->rx_size == 2) {
++            s->rx_needed = 3 + 2 *
++                (1 + (s->rx[1] & ODP_ESPI_VWIRE_COUNT_MASK));
++        }
++        if (!s->rx_needed && s->rx_size == 4) {
++            unsigned length = lduw_be_p(s->rx + 2) &
++                              ODP_ESPI_PACKET_LENGTH_MASK;
++
++            if (s->rx[1] == ODP_ESPI_CYCLE_MEM_WRITE32) {
++                s->rx_needed = 9 + (length ? length :
++                                    ODP_ESPI_PACKET_LENGTH_MAX);
++            } else if (s->rx[1] == ODP_ESPI_CYCLE_MEM_READ32) {
++                s->rx_needed = 9;
++            } else {
++                odp_espit_disconnect(s, ESPI_ERROR_UNSUPPORTED);
++                return;
++            }
++        }
++        if (s->rx_needed && s->rx_size == s->rx_needed) {
++            s->rx_state = ESPI_RX_KIND;
++            timer_del(s->timer);
++            odp_espit_command(s);
++            s->rx_size = 0;
++            s->rx_needed = 0;
++        }
++    }
++}
++
++static void odp_espit_event(void *opaque, QEMUChrEvent event)
++{
++    OdpESPITargetState *s = opaque;
++
++    switch (event) {
++    case CHR_EVENT_OPENED:
++        odp_espit_clear_io(s);
++        s->connected = true;
++        s->external_reset = false;
++        s->general = ESPI_GENERAL_SUPPORTED;
++        s->channel = ESPI_CH0_RESET;
++        s->vwire_channel = ESPI_CH1_RESET;
++        odp_espit_alert(s);
++        break;
++    case CHR_EVENT_CLOSED:
++        odp_espit_set_error(s, ESPI_ERROR_LINK |
++                           (odp_espit_pending(s) ? ESPI_ERROR_ABORT : 0));
++        s->connected = false;
++        s->external_reset = false;
++        s->general = ESPI_GENERAL_SUPPORTED;
++        s->channel = ESPI_CH0_RESET;
++        s->vwire_channel = ESPI_CH1_RESET;
++        odp_espit_clear_io(s);
++        break;
++    default:
++        break;
++    }
++    odp_espit_update_irq(s);
++}
++
++static bool odp_espit_decode_valid(OdpESPITargetState *s)
++{
++    uint32_t bases[] = {
++        s->mailboxes[0].base,
++        s->mailboxes[1].base,
++        s->mailbox_control_base,
++    };
++    unsigned index, previous;
++
++    for (index = 0; index < ARRAY_SIZE(bases); index++) {
++        if (bases[index] & (ESPI_MAILBOX_SIZE - 1)) {
++            return false;
++        }
++        for (previous = 0; previous < index; previous++) {
++            if (bases[index] == bases[previous]) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
++static uint64_t odp_espit_reg_read(void *opaque, hwaddr offset, unsigned size)
++{
++    OdpESPITargetState *s = opaque;
++    unsigned index;
++
++    switch (offset) {
++    case ESPI_REG_CONTROL:
++        return s->control;
++    case ESPI_REG_MAILBOX0_ADDR:
++    case ESPI_REG_MAILBOX1_ADDR:
++        index = (offset - ESPI_REG_MAILBOX0_ADDR) / 4;
++        return s->mailboxes[index].base;
++    case ESPI_REG_CONTROL_ADDR:
++        return s->mailbox_control_base;
++    }
++    if (offset >= ESPI_REG_MAILBOX_CONTROL &&
++        offset < ESPI_REG_MAILBOX_CONTROL +
++                 ESPI_MAILBOX_COUNT * ESPI_REG_MAILBOX_STRIDE) {
++        offset -= ESPI_REG_MAILBOX_CONTROL;
++        index = offset / ESPI_REG_MAILBOX_STRIDE;
++        return odp_espit_control_read(s,
++                   index * ESPI_MAILBOX_CONTROL_STRIDE +
++                   offset % ESPI_REG_MAILBOX_STRIDE);
++    }
++    return 0;
++}
++
++static void odp_espit_reg_write(void *opaque, hwaddr offset, uint64_t value,
++                                unsigned size)
++{
++    OdpESPITargetState *s = opaque;
++    unsigned index;
++
++    switch (offset) {
++    case ESPI_REG_CONTROL:
++        value &= ESPI_CONTROL_ENABLE;
++        if (value && !odp_espit_decode_valid(s)) {
++            odp_espit_set_error(s, ESPI_ERROR_CONFIG);
++            return;
++        }
++        s->control = value;
++        odp_espit_alert(s);
++        return;
++    case ESPI_REG_MAILBOX0_ADDR:
++    case ESPI_REG_MAILBOX1_ADDR:
++    case ESPI_REG_CONTROL_ADDR:
++        if (s->control & ESPI_CONTROL_ENABLE) {
++            odp_espit_set_error(s, ESPI_ERROR_CONFIG);
++        } else if (offset == ESPI_REG_CONTROL_ADDR) {
++            s->mailbox_control_base = value;
++        } else {
++            index = (offset - ESPI_REG_MAILBOX0_ADDR) / 4;
++            s->mailboxes[index].base = value;
++        }
++        return;
++    }
++    if (offset >= ESPI_REG_MAILBOX_CONTROL &&
++        offset < ESPI_REG_MAILBOX_CONTROL +
++                 ESPI_MAILBOX_COUNT * ESPI_REG_MAILBOX_STRIDE) {
++        offset -= ESPI_REG_MAILBOX_CONTROL;
++        index = offset / ESPI_REG_MAILBOX_STRIDE;
++        odp_espit_control_write(s, index * ESPI_MAILBOX_CONTROL_STRIDE +
++                                offset % ESPI_REG_MAILBOX_STRIDE,
++                               value, false);
++        odp_espit_alert(s);
++    }
++}
++
++static bool odp_espit_reg_accepts(void *opaque, hwaddr offset, unsigned size,
++                                  bool write, MemTxAttrs attrs)
++{
++    if (size != 4 || (offset & 3)) {
++        return false;
++    }
++    return true;
++}
++
++static const MemoryRegionOps odp_espit_reg_ops = {
++    .read = odp_espit_reg_read,
++    .write = odp_espit_reg_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4,
++               .accepts = odp_espit_reg_accepts },
++    .impl = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static uint64_t odp_espit_memory_read(void *opaque, hwaddr offset,
++                                     unsigned size)
++{
++    OdpESPIMailbox *mailbox = opaque;
++    uint64_t value = 0;
++    unsigned index;
++
++    for (index = 0; index < size; index++) {
++        value |= (uint64_t)mailbox->data[offset + index] << (index * 8);
++    }
++    return value;
++}
++
++static void odp_espit_memory_write(void *opaque, hwaddr offset, uint64_t value,
++                                   unsigned size)
++{
++    OdpESPIMailbox *mailbox = opaque;
++    unsigned index;
++
++    for (index = 0; index < size; index++) {
++        mailbox->data[offset + index] = value >> (index * 8);
++    }
++}
++
++static bool odp_espit_memory_accepts(void *opaque, hwaddr offset,
++                                     unsigned size, bool write,
++                                     MemTxAttrs attrs)
++{
++    if (size < 1 || size > 4 || (offset & (size - 1))) {
++        return false;
++    }
++    return true;
++}
++
++static const MemoryRegionOps odp_espit_memory_ops = {
++    .read = odp_espit_memory_read,
++    .write = odp_espit_memory_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 1, .max_access_size = 4,
++               .accepts = odp_espit_memory_accepts },
++    .impl = { .min_access_size = 1, .max_access_size = 4 },
++};
++
++static void odp_espi_target_init(Object *obj)
++{
++    OdpESPITargetState *s = ODP_ESPI_TARGET(obj);
++    SysBusDevice *busdev = SYS_BUS_DEVICE(obj);
++    unsigned index;
++
++    memory_region_init_io(&s->iomem, obj, &odp_espit_reg_ops, s,
++                          TYPE_ODP_ESPI_TARGET, ESPI_REG_SIZE);
++    sysbus_init_mmio(busdev, &s->iomem);
++    sysbus_init_irq(busdev, &s->irq);
++    for (index = 0; index < ESPI_MAILBOX_COUNT; index++) {
++        OdpESPIMailbox *mailbox = &s->mailboxes[index];
++
++        memory_region_init_io(&mailbox->iomem, obj, &odp_espit_memory_ops,
++                              mailbox, "odp-espi-mailbox", ESPI_MAILBOX_SIZE);
++        sysbus_init_mmio(busdev, &mailbox->iomem);
++    }
++}
++
++static void odp_espi_target_realize(DeviceState *dev, Error **errp)
++{
++    OdpESPITargetState *s = ODP_ESPI_TARGET(dev);
++
++    if (!s->timeout_ms || s->timeout_ms > INT_MAX) {
++        error_setg(errp, "eSPI timeout-ms must be between 1 and %d", INT_MAX);
++        return;
++    }
++    s->timer = timer_new_ms(QEMU_CLOCK_REALTIME, odp_espit_timeout, s);
++    odp_espit_reset_hold(OBJECT(dev), RESET_TYPE_COLD);
++    qemu_chr_fe_set_handlers(&s->chr, odp_espit_can_receive, odp_espit_receive,
++                             odp_espit_event, NULL, s, NULL, true);
++}
++
++static void odp_espi_target_unrealize(DeviceState *dev)
++{
++    OdpESPITargetState *s = ODP_ESPI_TARGET(dev);
++
++    qemu_chr_fe_set_handlers(&s->chr, NULL, NULL, NULL, NULL, NULL,
++                             NULL, false);
++    odp_espit_clear_io(s);
++    qemu_set_irq(s->irq, 0);
++    timer_free(s->timer);
++}
++
++static const Property odp_espi_target_properties[] = {
++    DEFINE_PROP_CHR("chardev", OdpESPITargetState, chr),
++    DEFINE_PROP_UINT32("timeout-ms", OdpESPITargetState, timeout_ms, 1000),
++};
++
++static const VMStateDescription odp_espit_vmstate = {
++    .name = TYPE_ODP_ESPI_TARGET,
++    .unmigratable = true,
++};
++
++static void odp_espi_target_class_init(ObjectClass *oc, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    ResettableClass *rc = RESETTABLE_CLASS(oc);
++
++    dc->desc = "ODP socket-backed eSPI target";
++    dc->realize = odp_espi_target_realize;
++    dc->unrealize = odp_espi_target_unrealize;
++    dc->vmsd = &odp_espit_vmstate;
++    dc->hotpluggable = false;
++    rc->phases.hold = odp_espit_reset_hold;
++    device_class_set_props(dc, odp_espi_target_properties);
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++}
++
++static const TypeInfo odp_espi_target_info = {
++    .name          = TYPE_ODP_ESPI_TARGET,
++    .parent        = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(OdpESPITargetState),
++    .instance_init = odp_espi_target_init,
++    .class_init    = odp_espi_target_class_init,
++};
++
++static void odp_espi_target_register_types(void)
++{
++    type_register_static(&odp_espi_target_info);
++}
++
++type_init(odp_espi_target_register_types)
+diff --git a/hw/odp/meson.build b/hw/odp/meson.build
+index 5ef8da24da..de6301c114 100644
+--- a/hw/odp/meson.build
++++ b/hw/odp/meson.build
+@@ -1,4 +1,6 @@
+ system_ss.add(when: 'CONFIG_ODP_I2C_CONTROLLER', if_true: files('i2c-controller.c'))
+ system_ss.add(when: 'CONFIG_ODP_I2C_TARGET', if_true: files('i2c-target.c'))
++system_ss.add(when: 'CONFIG_ODP_ESPI_CONTROLLER', if_true: files('espi-controller.c'))
++system_ss.add(when: 'CONFIG_ODP_ESPI_TARGET', if_true: files('espi-target.c'))
+ system_ss.add(when: 'CONFIG_ODP_GPIO', if_true: files('gpio.c'))
+ system_ss.add(when: 'CONFIG_ODP_PL061', if_true: files('pl061.c'))
+diff --git a/hw/riscv/Kconfig b/hw/riscv/Kconfig
+index 984e9cf6d7..94feb775a0 100644
+--- a/hw/riscv/Kconfig
++++ b/hw/riscv/Kconfig
+@@ -50,6 +50,7 @@ config RISCV_EC
+     select SIFIVE_PLIC
+     select ODP_I2C_CONTROLLER
+     select ODP_I2C_TARGET
++    select ODP_ESPI_TARGET
+     select ODP_GPIO
+ 
+ config RISCV_VIRT
+diff --git a/hw/riscv/ec.c b/hw/riscv/ec.c
+index c7028d2381..3481bf293c 100644
+--- a/hw/riscv/ec.c
++++ b/hw/riscv/ec.c
+@@ -25,6 +25,7 @@
+ #include "hw/odp/i2c-controller.h"
+ #include "hw/odp/i2c-target.h"
+ #include "hw/odp/gpio.h"
++#include "hw/odp/espi-target.h"
+ #include "chardev/char.h"
+ #include "system/system.h"
+ #include "elf.h"
+@@ -36,6 +37,9 @@ static const MemMapEntry ec_memmap[] = {
+     [EC_I2C0]  = { 0x10001000,       0x1000 },
+     [EC_I2C_TARGET] = { 0x10002000,  0x1000 },
+     [EC_GPIO]  = { 0x10003000,       0x1000 },
++    [EC_ESPI_TARGET] = { 0x10004000, 0x1000 },
++    [EC_ESPI_MAILBOX0] = { 0x10005000, 0x1000 },
++    [EC_ESPI_MAILBOX1] = { 0x10006000, 0x1000 },
+     [EC_RAM]   = { 0x80000000,          0x0 },
+ };
+ 
+@@ -212,6 +216,23 @@ static void ec_machine_init(MachineState *machine)
+     sysbus_connect_irq(SYS_BUS_DEVICE(s->gpio0), 0,
+                        qdev_get_gpio_in(s->plic, EC_GPIO_IRQ));
+ 
++    s->espi_target = qdev_new(TYPE_ODP_ESPI_TARGET);
++    {
++        Chardev *espi_chr = qemu_chr_find("ec-espi-target");
++        if (espi_chr) {
++            qdev_prop_set_chr(s->espi_target, "chardev", espi_chr);
++        }
++    }
++    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->espi_target), &error_fatal);
++    sysbus_mmio_map(SYS_BUS_DEVICE(s->espi_target), 0,
++                    s->memmap[EC_ESPI_TARGET].base);
++    sysbus_mmio_map(SYS_BUS_DEVICE(s->espi_target), 1,
++                    s->memmap[EC_ESPI_MAILBOX0].base);
++    sysbus_mmio_map(SYS_BUS_DEVICE(s->espi_target), 2,
++                    s->memmap[EC_ESPI_MAILBOX1].base);
++    sysbus_connect_irq(SYS_BUS_DEVICE(s->espi_target), 0,
++                       qdev_get_gpio_in(s->plic, EC_ESPI_TARGET_IRQ));
++
+     /* Firmware loading happens in machine_done */
+     s->machine_done.notify = ec_machine_done;
+     qemu_add_machine_init_done_notifier(&s->machine_done);
+diff --git a/include/hw/arm/virt.h b/include/hw/arm/virt.h
+index 7ad787aa90..f9a77bafb7 100644
+--- a/include/hw/arm/virt.h
++++ b/include/hw/arm/virt.h
+@@ -80,6 +80,7 @@ enum {
+     VIRT_NVDIMM_ACPI,
+     VIRT_PVTIME,
+     VIRT_I2C,
++    VIRT_ESPI,
+     VIRT_LOWMEMMAP_LAST,
+ };
+ 
+diff --git a/include/hw/odp/espi-controller.h b/include/hw/odp/espi-controller.h
+new file mode 100644
+index 0000000000..51fb5ec37f
+--- /dev/null
++++ b/include/hw/odp/espi-controller.h
+@@ -0,0 +1,21 @@
++#ifndef HW_ODP_ESPI_CONTROLLER_H
++#define HW_ODP_ESPI_CONTROLLER_H
++
++#include "hw/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_ODP_ESPI_CONTROLLER "odp-espi-controller"
++#define ODP_ESPI_IRQ_COUNT 2
++
++/*
++ * Default host MMIO layout: two 4-KiB data windows spaced 64 KiB apart,
++ * plus a separate control window with one 0x20-byte group per channel.
++ */
++#define ODP_ESPI_SHARED_BASE    0x090f0000
++#define ODP_ESPI_SHARED_STRIDE  0x10000
++#define ODP_ESPI_CONTROL_BASE   0x09110000
++#define ODP_ESPI_CONTROL_STRIDE 0x20
++
++OBJECT_DECLARE_SIMPLE_TYPE(OdpESPIControllerState, ODP_ESPI_CONTROLLER)
++
++#endif
+diff --git a/include/hw/odp/espi-proto.h b/include/hw/odp/espi-proto.h
+new file mode 100644
+index 0000000000..fa38e16bcb
+--- /dev/null
++++ b/include/hw/odp/espi-proto.h
+@@ -0,0 +1,145 @@
++#ifndef HW_ODP_ESPI_PROTO_H
++#define HW_ODP_ESPI_PROTO_H
++
++#define ODP_ESPI_WIRE_DATA  0x00
++#define ODP_ESPI_WIRE_ALERT 0x01
++#define ODP_ESPI_WIRE_RESET 0x02
++
++#define ODP_ESPI_WIRE_RESET_DEASSERTED 0x00
++#define ODP_ESPI_WIRE_RESET_ASSERTED   0x01
++
++#define ODP_ESPI_CMD_PUT_PC            0x00
++#define ODP_ESPI_CMD_GET_PC            0x01
++#define ODP_ESPI_CMD_PUT_NP            0x02
++#define ODP_ESPI_CMD_PUT_VWIRE         0x04
++#define ODP_ESPI_CMD_GET_VWIRE         0x05
++#define ODP_ESPI_CMD_GET_CONFIGURATION 0x21
++#define ODP_ESPI_CMD_SET_CONFIGURATION 0x22
++#define ODP_ESPI_CMD_GET_STATUS        0x25
++
++#define ODP_ESPI_RSP_ACCEPT          0x08
++#define ODP_ESPI_RSP_DEFER           0x01
++#define ODP_ESPI_RSP_NON_FATAL_ERROR 0x02
++#define ODP_ESPI_RSP_FATAL_ERROR     0x03
++#define ODP_ESPI_RSP_WAIT_STATE      0x0f
++#define ODP_ESPI_RSP_NO_RESPONSE     0xff
++
++#define ODP_ESPI_STATUS_PC_FREE  (1U << 0)
++#define ODP_ESPI_STATUS_NP_FREE  (1U << 1)
++#define ODP_ESPI_STATUS_VWIRE_FREE (1U << 2)
++#define ODP_ESPI_STATUS_PC_AVAIL (1U << 4)
++#define ODP_ESPI_STATUS_NP_AVAIL (1U << 5)
++#define ODP_ESPI_STATUS_VWIRE_AVAIL (1U << 6)
++
++#define ODP_ESPI_VWIRE_COUNT_MASK 0x3f
++#define ODP_ESPI_VWIRE_MIN_COUNT  8
++#define ODP_ESPI_VWIRE_MAX_COUNT  64
++#define ODP_ESPI_VWIRE_GROUP_SIZE 2
++#define ODP_ESPI_VWIRE_MAX_PACKET_SIZE \
++    (1 + ODP_ESPI_VWIRE_GROUP_SIZE * ODP_ESPI_VWIRE_MAX_COUNT)
++#define ODP_ESPI_VWIRE_IRQ_LOW    0x00
++#define ODP_ESPI_VWIRE_IRQ_HIGH   0x01
++#define ODP_ESPI_VWIRE_IRQ_LEVEL  0x80
++#define ODP_ESPI_VWIRE_IRQ_MASK   0x7f
++#define ODP_ESPI_VWIRE_GPIO_BASE  0x80
++#define ODP_ESPI_VWIRE_VALID_SHIFT 4
++#define ODP_ESPI_VWIRE_LEVEL_MASK 0x0f
++
++#define ODP_ESPI_CYCLE_MEM_READ32          0x00
++#define ODP_ESPI_CYCLE_MEM_WRITE32         0x01
++#define ODP_ESPI_CYCLE_SUCCESS_DATA_MIDDLE 0x09
++#define ODP_ESPI_CYCLE_SUCCESS_DATA_FIRST  0x0b
++#define ODP_ESPI_CYCLE_SUCCESS_DATA_LAST   0x0d
++#define ODP_ESPI_CYCLE_SUCCESS_DATA_ONLY   0x0f
++#define ODP_ESPI_CYCLE_UNSUCCESSFUL_LAST   0x0c
++#define ODP_ESPI_CYCLE_UNSUCCESSFUL_ONLY   0x0e
++
++/*
++ * Native phase sizes exclude the socket wire kind. Packet offsets start at
++ * Cycle Type, after the command or response opcode (eSPI 1.6, section 4.1).
++ * Lengths and addresses are big-endian. Configuration data and status are
++ * little-endian; memory payload bytes remain in address order (section 5.1).
++ */
++#define ODP_ESPI_OPCODE_SIZE 1
++#define ODP_ESPI_STATUS_SIZE 2
++#define ODP_ESPI_CRC_SIZE    1
++
++#define ODP_ESPI_PACKET_CYCLE_OFFSET         0
++#define ODP_ESPI_PACKET_TAG_LENGTH_HI_OFFSET 1
++#define ODP_ESPI_PACKET_LENGTH_LO_OFFSET     2
++#define ODP_ESPI_PACKET_HEADER_SIZE          3
++
++#define ODP_ESPI_PACKET_TAG_SHIFT       4
++#define ODP_ESPI_PACKET_TAG_MASK        0xf0
++#define ODP_ESPI_PACKET_LENGTH_HI_SHIFT 8
++#define ODP_ESPI_PACKET_LENGTH_HI_MASK  0x0f
++#define ODP_ESPI_PACKET_LENGTH_MASK     0x0fff
++#define ODP_ESPI_PACKET_LENGTH_MAX      4096
++
++/*
++ * A zero length encodes 4096 bytes for memory requests and data completions.
++ * Reads specify bytes requested; writes/data completions specify bytes present.
++ * Completions without data encode zero and ignore the received length field.
++ */
++#define ODP_ESPI_MEM32_ADDR_OFFSET ODP_ESPI_PACKET_HEADER_SIZE
++#define ODP_ESPI_MEM32_ADDR_SIZE   4
++#define ODP_ESPI_MEM32_HEADER_SIZE \
++    (ODP_ESPI_PACKET_HEADER_SIZE + ODP_ESPI_MEM32_ADDR_SIZE)
++#define ODP_ESPI_MEM32_DATA_OFFSET      ODP_ESPI_MEM32_HEADER_SIZE
++#define ODP_ESPI_COMPLETION_DATA_OFFSET ODP_ESPI_PACKET_HEADER_SIZE
++
++#define ODP_ESPI_CONFIG_ADDRESS_SIZE 2
++#define ODP_ESPI_CONFIG_VALUE_SIZE   4
++#define ODP_ESPI_CONFIG_SPACE_SIZE   0x1000
++
++/* Native target configuration registers, not frontend MMIO (section 6.2.1). */
++#define ODP_ESPI_CONFIG_DEVICE_ID 0x0004
++#define ODP_ESPI_CONFIG_GENERAL   0x0008
++#define ODP_ESPI_CONFIG_CH0       0x0010
++#define ODP_ESPI_CONFIG_CH1       0x0020
++
++#define ODP_ESPI_DEVICE_ID_VERSION_MASK 0xff
++#define ODP_ESPI_DEVICE_ID_VERSION      0x01
++
++#define ODP_ESPI_GENERAL_CHANNELS_MASK      0xff
++#define ODP_ESPI_GENERAL_CHANNEL0_SUPPORTED (1U << 0)
++#define ODP_ESPI_GENERAL_CHANNEL1_SUPPORTED (1U << 1)
++#define ODP_ESPI_GENERAL_CRC_ENABLE         (1U << 31)
++
++#define ODP_ESPI_CH0_ENABLE            (1U << 0)
++#define ODP_ESPI_CH0_READY             (1U << 1)
++#define ODP_ESPI_CH0_BUS_MASTER_ENABLE (1U << 2)
++
++#define ODP_ESPI_CH0_MAX_PAYLOAD_SUPPORTED_SHIFT 4
++#define ODP_ESPI_CH0_MAX_PAYLOAD_SUPPORTED_MASK \
++    (7U << ODP_ESPI_CH0_MAX_PAYLOAD_SUPPORTED_SHIFT)
++#define ODP_ESPI_CH0_MAX_PAYLOAD_SELECTED_SHIFT 8
++#define ODP_ESPI_CH0_MAX_PAYLOAD_SELECTED_MASK \
++    (7U << ODP_ESPI_CH0_MAX_PAYLOAD_SELECTED_SHIFT)
++#define ODP_ESPI_CH0_MAX_READ_REQUEST_SHIFT 12
++#define ODP_ESPI_CH0_MAX_READ_REQUEST_MASK \
++    (7U << ODP_ESPI_CH0_MAX_READ_REQUEST_SHIFT)
++
++#define ODP_ESPI_CH1_ENABLE (1U << 0)
++#define ODP_ESPI_CH1_READY  (1U << 1)
++#define ODP_ESPI_CH1_MAX_COUNT_SUPPORTED_SHIFT 8
++#define ODP_ESPI_CH1_MAX_COUNT_SUPPORTED_MASK \
++    (ODP_ESPI_VWIRE_COUNT_MASK << ODP_ESPI_CH1_MAX_COUNT_SUPPORTED_SHIFT)
++#define ODP_ESPI_CH1_MAX_COUNT_SELECTED_SHIFT 16
++#define ODP_ESPI_CH1_MAX_COUNT_SELECTED_MASK \
++    (ODP_ESPI_VWIRE_COUNT_MASK << ODP_ESPI_CH1_MAX_COUNT_SELECTED_SHIFT)
++
++/* Payload sizes use codes 1-3; read request sizes use codes 1-7. */
++#define ODP_ESPI_SIZE_64B_CODE   0x1
++#define ODP_ESPI_SIZE_128B_CODE  0x2
++#define ODP_ESPI_SIZE_256B_CODE  0x3
++#define ODP_ESPI_SIZE_512B_CODE  0x4
++#define ODP_ESPI_SIZE_1024B_CODE 0x5
++#define ODP_ESPI_SIZE_2048B_CODE 0x6
++#define ODP_ESPI_SIZE_4096B_CODE 0x7
++
++/* CRC excludes the wire kind and WAIT_STATE response bytes (section 5.2). */
++#define ODP_ESPI_CRC8_POLYNOMIAL 0x07
++#define ODP_ESPI_CRC8_INIT       0x00
++
++#endif
+diff --git a/include/hw/odp/espi-target.h b/include/hw/odp/espi-target.h
+new file mode 100644
+index 0000000000..5dd9a0e9b5
+--- /dev/null
++++ b/include/hw/odp/espi-target.h
+@@ -0,0 +1,10 @@
++#ifndef HW_ODP_ESPI_TARGET_H
++#define HW_ODP_ESPI_TARGET_H
++
++#include "hw/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_ODP_ESPI_TARGET "odp-espi-target"
++OBJECT_DECLARE_SIMPLE_TYPE(OdpESPITargetState, ODP_ESPI_TARGET)
++
++#endif
+\ No newline at end of file
+diff --git a/include/hw/riscv/ec.h b/include/hw/riscv/ec.h
+index 71089ce5b1..62a9c31c7f 100644
+--- a/include/hw/riscv/ec.h
++++ b/include/hw/riscv/ec.h
+@@ -29,6 +29,7 @@ struct RISCVECState {
+     DeviceState *i2c0;
+     DeviceState *i2c_target;
+     DeviceState *gpio0;
++    DeviceState *espi_target;
+     const MemMapEntry *memmap;
+     Notifier machine_done;
+ };
+@@ -40,6 +41,9 @@ enum {
+     EC_I2C0,
+     EC_I2C_TARGET,
+     EC_GPIO,
++    EC_ESPI_TARGET,
++    EC_ESPI_MAILBOX0,
++    EC_ESPI_MAILBOX1,
+     EC_RAM,
+ };
+ 
+@@ -48,6 +52,7 @@ enum {
+     EC_I2C0_IRQ = 2,
+     EC_I2C_TARGET_IRQ = 3,
+     EC_GPIO_IRQ = 4,
++    EC_ESPI_TARGET_IRQ = 5,
+ };
+ 
+ #define EC_IRQCHIP_NUM_SOURCES  32
