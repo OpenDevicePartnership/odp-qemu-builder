@@ -652,10 +652,10 @@ index 0000000000..eae96ef325
 +type_init(odp_gpio_register_types)
 diff --git a/hw/odp/i2c-controller.c b/hw/odp/i2c-controller.c
 new file mode 100644
-index 0000000000..e8dce74f24
+index 0000000..fa01c08
 --- /dev/null
 +++ b/hw/odp/i2c-controller.c
-@@ -0,0 +1,587 @@
+@@ -0,0 +1,661 @@
 +/*
 + * ODP socket-backed I2C controller (master)
 + *
@@ -717,6 +717,7 @@ index 0000000000..e8dce74f24
 +#define DATA_DATA_MASK      0xffu
 +#define DATA_CMD_SHIFT      8
 +#define DATA_CMD_MASK       0x3u
++#define DATA_RX_MORE        (1u << 10)
 +#define CMD_START           0x0
 +#define CMD_STOP            0x1
 +#define CMD_RX              0x2
@@ -756,6 +757,8 @@ index 0000000000..e8dce74f24
 +    OdpI2CState state;
 +    bool addr_is_recv;   /* R/W bit of the most recent (re)START address */
 +    bool rx_burst_done;  /* an RX burst finished; must STOP or repeat-START */
++    bool rx_more;
++    bool rx_ack_pending;
 +    uint32_t rx_remaining;
 +    bool awaiting_payload; /* last wire opcode was DATA, next byte is payload */
 +
@@ -801,6 +804,19 @@ index 0000000000..e8dce74f24
 +    qemu_chr_fe_write_all(&s->chr, buf, len);
 +}
 +
++static void odp_i2c_end_rx(OdpI2CControllerState *s)
++{
++    odp_i2c_disarm_timeout(s);
++    s->awaiting_payload = false;
++    if (s->rx_ack_pending) {
++        uint8_t reply = WIRE_NAK;
++
++        s->rx_ack_pending = false;
++        odp_i2c_wire_send(s, &reply, 1);
++    }
++    s->rx_more = false;
++}
++
 +/*
 + * Reset the controller back to the idle state.  Shared by the CTRL soft-reset
 + * bit and the QOM cold-reset path.  Soft reset keeps the interrupt-enable
@@ -808,7 +824,14 @@ index 0000000000..e8dce74f24
 + */
 +static void odp_i2c_do_reset(OdpI2CControllerState *s, bool keep_int_enables)
 +{
-+    odp_i2c_disarm_timeout(s);
++    bool active = s->state != ODP_I2C_IDLE;
++
++    odp_i2c_end_rx(s);
++    if (active) {
++        uint8_t op = WIRE_STOP;
++
++        odp_i2c_wire_send(s, &op, 1);
++    }
 +    fifo8_reset(&s->rx_fifo);
 +
 +    s->status = 0;
@@ -831,19 +854,31 @@ index 0000000000..e8dce74f24
 +
 +static void odp_i2c_proto_error(OdpI2CControllerState *s)
 +{
++    bool active = s->state != ODP_I2C_IDLE;
++
++    odp_i2c_end_rx(s);
++    if (active) {
++        uint8_t op = WIRE_STOP;
++
++        odp_i2c_wire_send(s, &op, 1);
++    }
 +    s->status |= STATUS_PROTO_ERR;
 +    s->state = ODP_I2C_IDLE;
++    s->rx_burst_done = false;
++    s->rx_remaining = 0;
++    odp_i2c_set_cmd_done(s);
 +}
 +
 +static void odp_i2c_do_start(OdpI2CControllerState *s, uint8_t addr)
 +{
 +    uint8_t frame[2] = { WIRE_START, addr };
 +
++    odp_i2c_end_rx(s);
 +    s->addr_is_recv = addr & 0x1;
 +    s->rx_burst_done = false;
-+    odp_i2c_wire_send(s, frame, sizeof(frame));
 +    s->state = ODP_I2C_WAIT_START_ACK;
 +    odp_i2c_arm_timeout(s);
++    odp_i2c_wire_send(s, frame, sizeof(frame));
 +}
 +
 +static void odp_i2c_do_tx(OdpI2CControllerState *s, uint8_t byte)
@@ -855,10 +890,21 @@ index 0000000000..e8dce74f24
 +    odp_i2c_arm_timeout(s);
 +}
 +
-+static void odp_i2c_do_rx(OdpI2CControllerState *s, uint8_t count_minus_one)
++static void odp_i2c_do_rx(OdpI2CControllerState *s, uint8_t count_minus_one,
++                        bool more)
 +{
++    bool continuing = s->rx_ack_pending;
++
++    s->rx_ack_pending = false;
++    s->rx_more = more;
 +    s->rx_remaining = (uint32_t)count_minus_one + 1;
 +    s->state = ODP_I2C_RX;
++    odp_i2c_arm_timeout(s);
++    if (continuing) {
++        uint8_t reply = WIRE_ACK;
++
++        odp_i2c_wire_send(s, &reply, 1);
++    }
 +    /* The chardev may have been throttled; make sure we can take bytes. */
 +    qemu_chr_fe_accept_input(&s->chr);
 +}
@@ -867,6 +913,7 @@ index 0000000000..e8dce74f24
 +{
 +    uint8_t op = WIRE_STOP;
 +
++    odp_i2c_end_rx(s);
 +    odp_i2c_wire_send(s, &op, 1);
 +    s->rx_burst_done = false;
 +    s->state = ODP_I2C_IDLE;
@@ -874,8 +921,13 @@ index 0000000000..e8dce74f24
 +}
 +
 +static void odp_i2c_dispatch_cmd(OdpI2CControllerState *s,
-+                                 uint8_t cmd, uint8_t data)
++                                 uint8_t cmd, uint8_t data, bool more)
 +{
++    if (more && cmd != CMD_RX) {
++        odp_i2c_proto_error(s);
++        return;
++    }
++
 +    switch (s->state) {
 +    case ODP_I2C_IDLE:
 +        if (cmd == CMD_START) {
@@ -895,8 +947,9 @@ index 0000000000..e8dce74f24
 +            odp_i2c_do_start(s, data);
 +            break;
 +        case CMD_RX:
-+            if (s->addr_is_recv && !s->rx_burst_done) {
-+                odp_i2c_do_rx(s, data);
++            if (s->addr_is_recv && !s->rx_burst_done &&
++                fifo8_is_empty(&s->rx_fifo)) {
++                odp_i2c_do_rx(s, data, more);
 +            } else {
 +                odp_i2c_proto_error(s);
 +            }
@@ -920,7 +973,7 @@ index 0000000000..e8dce74f24
 +        qemu_log_mask(LOG_GUEST_ERROR,
 +                      "%s: command written while controller busy\n",
 +                      TYPE_ODP_I2C_CONTROLLER);
-+        s->status |= STATUS_PROTO_ERR;
++        odp_i2c_proto_error(s);
 +        break;
 +
 +    default:
@@ -982,13 +1035,20 @@ index 0000000000..e8dce74f24
 +    s->rx_remaining--;
 +
 +    if (s->rx_remaining > 0) {
++        odp_i2c_arm_timeout(s);
 +        reply = WIRE_ACK;
 +        odp_i2c_wire_send(s, &reply, 1);
++    } else if (s->rx_more) {
++        s->rx_ack_pending = true;
++        s->state = ODP_I2C_READY;
++        odp_i2c_arm_timeout(s);
++        odp_i2c_set_cmd_done(s);
 +    } else {
++        odp_i2c_disarm_timeout(s);
 +        reply = WIRE_NAK;
-+        odp_i2c_wire_send(s, &reply, 1);
 +        s->rx_burst_done = true;
 +        s->state = ODP_I2C_READY;
++        odp_i2c_wire_send(s, &reply, 1);
 +        odp_i2c_set_cmd_done(s);
 +    }
 +
@@ -1054,6 +1114,10 @@ index 0000000000..e8dce74f24
 +        s->status |= STATUS_NAK;
 +        s->state = ODP_I2C_IDLE;
 +        s->awaiting_payload = false;
++        s->rx_ack_pending = false;
++        s->rx_more = false;
++        s->rx_burst_done = false;
++        s->rx_remaining = 0;
 +        odp_i2c_set_cmd_done(s);
 +    }
 +}
@@ -1063,9 +1127,16 @@ index 0000000000..e8dce74f24
 +    OdpI2CControllerState *s = opaque;
 +
 +    if (s->state == ODP_I2C_WAIT_START_ACK ||
-+        s->state == ODP_I2C_WAIT_TX_ACK) {
++        s->state == ODP_I2C_WAIT_TX_ACK ||
++        s->state == ODP_I2C_RX || s->rx_ack_pending) {
++        odp_i2c_end_rx(s);
++        uint8_t op = WIRE_STOP;
++
++        odp_i2c_wire_send(s, &op, 1);
 +        s->status |= STATUS_NAK;
 +        s->state = ODP_I2C_IDLE;
++        s->rx_burst_done = false;
++        s->rx_remaining = 0;
 +        odp_i2c_set_cmd_done(s);
 +    }
 +}
@@ -1129,6 +1200,9 @@ index 0000000000..e8dce74f24
 +        }
 +        s->ctrl = value & CTRL_IE_MASK;
 +        if (value & CTRL_CLEAR_FIFO) {
++            if (s->state == ODP_I2C_RX || s->rx_ack_pending) {
++                odp_i2c_proto_error(s);
++            }
 +            fifo8_reset(&s->rx_fifo);
 +            s->status &= ~STATUS_RX_RDY;
 +            qemu_chr_fe_accept_input(&s->chr);
@@ -1146,7 +1220,7 @@ index 0000000000..e8dce74f24
 +        uint8_t cmd = (value >> DATA_CMD_SHIFT) & DATA_CMD_MASK;
 +        uint8_t data = value & DATA_DATA_MASK;
 +
-+        odp_i2c_dispatch_cmd(s, cmd, data);
++        odp_i2c_dispatch_cmd(s, cmd, data, value & DATA_RX_MORE);
 +        break;
 +    }
 +
