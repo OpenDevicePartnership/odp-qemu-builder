@@ -2312,10 +2312,10 @@ index e6a0ac1fa1..984e9cf6d7 100644
      default y
 diff --git a/hw/riscv/ec.c b/hw/riscv/ec.c
 new file mode 100644
-index 0000000000..c7028d2381
+index 0000000000..2047b32a7a
 --- /dev/null
 +++ b/hw/riscv/ec.c
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,248 @@
 +/*
 + * QEMU RISC-V Embedded Controller (EC) Board
 + *
@@ -2514,15 +2514,20 @@ index 0000000000..c7028d2381
 +                       qdev_get_gpio_in(s->plic, EC_I2C_TARGET_IRQ));
 +
 +    /*
-+     * Socket-backed bidirectional GPIO controller. Pin 0 is bridged to a peer
-+     * over a chardev looked up by id ('-chardev socket,id=ec-gpio0,...'); the
-+     * backend is optional and the device still maps without a peer attached.
++     * Socket-backed bidirectional GPIO controller. Pins 0 and 1 use optional
++     * ec-gpio0 and ec-gpio1 chardev backends; the device still maps without
++     * peers attached.
 +     */
 +    s->gpio0 = qdev_new(TYPE_ODP_GPIO);
 +    {
 +        Chardev *gpio_chr = qemu_chr_find("ec-gpio0");
 +        if (gpio_chr) {
 +            qdev_prop_set_chr(s->gpio0, "gpio0", gpio_chr);
++        }
++
++        gpio_chr = qemu_chr_find("ec-gpio1");
++        if (gpio_chr) {
++            qdev_prop_set_chr(s->gpio0, "gpio1", gpio_chr);
 +        }
 +    }
 +    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->gpio0), &error_fatal);
