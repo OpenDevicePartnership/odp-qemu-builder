@@ -42,8 +42,8 @@ RUN --mount=type=cache,id=ccache-${TARGETARCH},target=/root/.cache/ccache \
     cd qemu && \
     git apply /tmp/qemu-sbsa-patch.patch && \
     git apply /tmp/qemu-bus-emulation.patch && \
-    PATH="/usr/lib/ccache:${PATH}" ./configure --target-list=aarch64-softmmu,riscv32-softmmu --enable-plugins --enable-tpm --enable-gtk --enable-modules --prefix=/usr/local --libdir=/usr/local/lib && \
-    PATH="/usr/lib/ccache:${PATH}" ninja -C build qemu-system-aarch64 qemu-system-riscv32 && \
+    PATH="/usr/lib/ccache:${PATH}" ./configure --target-list=aarch64-softmmu,riscv32-softmmu,x86_64-softmmu --enable-plugins --enable-tpm --enable-gtk --enable-modules --prefix=/usr/local --libdir=/usr/local/lib && \
+    PATH="/usr/lib/ccache:${PATH}" ninja -C build qemu-system-aarch64 qemu-system-riscv32 qemu-system-x86_64 && \
     ninja -C build install && \
     cd .. && \
     rm -rf qemu

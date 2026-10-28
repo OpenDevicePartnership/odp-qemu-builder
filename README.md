@@ -1,6 +1,6 @@
 # qemu-builder
 
-Prebuilt QEMU `aarch64` and `riscv32` binaries for Ubuntu 24.04, published as a multi-arch Docker image (`amd64` / `arm64`) with TPM support enabled.
+Prebuilt QEMU `aarch64`, `riscv32`, and `x86_64` binaries for Ubuntu 24.04, published as a multi-arch Docker image (`amd64` / `arm64`) with TPM support enabled.
 
 ## Usage
 

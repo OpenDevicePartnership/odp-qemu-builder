@@ -68,6 +68,12 @@ jobs:
             local/qemu-builder:${{ steps.ptag.outputs.tag }} \
             qemu-system-riscv32 --version | tee /dev/stderr | grep -qF '${{ steps.qver.outputs.version }}'
 
+      - name: Smoke test - qemu-system-x86_64 --version
+        run: |
+          docker run --rm --platform=${{ matrix.platform }} \
+            local/qemu-builder:${{ steps.ptag.outputs.tag }} \
+            qemu-system-x86_64 --version | tee /dev/stderr | grep -qF '${{ steps.qver.outputs.version }}'
+
       - name: IMG-03 — riscv32 firmware blob present
         run: |
           docker run --rm --platform=${{ matrix.platform }} \
@@ -87,7 +93,7 @@ jobs:
 
       - name: Summary
         run: |
-          echo "::notice::Smoke tests passed for ${{ matrix.platform }} — qemu-system-aarch64 + qemu-system-riscv32 v${{ steps.qver.outputs.version }}"
+          echo "::notice::Smoke tests passed for ${{ matrix.platform }} — qemu-system-aarch64 + qemu-system-riscv32 + qemu-system-x86_64 v${{ steps.qver.outputs.version }}"
 
   push:
     needs: build-and-test
