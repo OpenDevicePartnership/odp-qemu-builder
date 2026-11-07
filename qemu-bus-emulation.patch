@@ -2761,3 +2761,158 @@ index 0000000000..71089ce5b1
 +    (EC_PLIC_CONTEXT_BASE + 1 * EC_PLIC_CONTEXT_STRIDE)
 +
 +#endif
+diff --git a/hw/i386/Kconfig b/hw/i386/Kconfig
+index d34ce07b21..9477ec65cb 100644
+--- a/hw/i386/Kconfig
++++ b/hw/i386/Kconfig
+@@ -113,6 +113,10 @@ config Q35
+     select SMBIOS
+     select FW_CFG_DMA
+ 
++    select ODP_I2C_CONTROLLER
++    select ODP_PL061
++    select OR_IRQ
++
+ config MICROVM
+     bool
+     default y
+diff --git a/hw/i386/acpi-build.c b/hw/i386/acpi-build.c
+index 3fffa4a332..6153d83dcf 100644
+--- a/hw/i386/acpi-build.c
++++ b/hw/i386/acpi-build.c
+@@ -1187,6 +1187,34 @@ static void build_q35_pci0_int(Aml *table)
+     aml_append(table, sb_scope);
+ }
+ 
++static void build_q35_odp_devices(Aml *scope)
++{
++    Aml *dev = aml_device("I2C0");
++    Aml *crs = aml_resource_template();
++    uint32_t irq = Q35_ODP_I2C_IRQ;
++
++    aml_append(dev, aml_name_decl("_HID", aml_string("QEMU0001")));
++    aml_append(dev, aml_name_decl("_UID", aml_int(1)));
++    aml_append(crs, aml_memory32_fixed(Q35_ODP_I2C_BASE,
++                                      Q35_ODP_MMIO_SIZE, AML_READ_WRITE));
++    aml_append(crs, aml_interrupt(AML_CONSUMER, AML_LEVEL, AML_ACTIVE_HIGH,
++                                  AML_EXCLUSIVE, &irq, 1));
++    aml_append(dev, aml_name_decl("_CRS", crs));
++    aml_append(scope, dev);
++
++    dev = aml_device("GPO0");
++    crs = aml_resource_template();
++    irq = Q35_ODP_GPIO_IRQ;
++    aml_append(dev, aml_name_decl("_HID", aml_string("ARMH0061")));
++    aml_append(dev, aml_name_decl("_UID", aml_int(0)));
++    aml_append(crs, aml_memory32_fixed(Q35_ODP_GPIO_BASE,
++                                      Q35_ODP_MMIO_SIZE, AML_READ_WRITE));
++    aml_append(crs, aml_interrupt(AML_CONSUMER, AML_LEVEL, AML_ACTIVE_HIGH,
++                                  AML_EXCLUSIVE, &irq, 1));
++    aml_append(dev, aml_name_decl("_CRS", crs));
++    aml_append(scope, dev);
++}
++
+ static Aml *build_q35_dram_controller(const AcpiMcfgInfo *mcfg)
+ {
+     Aml *dev;
+@@ -1399,6 +1427,7 @@ build_dsdt(GArray *table_data, BIOSLinker *linker,
+         build_piix4_pci0_int(dsdt);
+     } else if (q35) {
+         sb_scope = aml_scope("_SB");
++        build_q35_odp_devices(sb_scope);
+         dev = aml_device("PCI0");
+         aml_append(dev, aml_name_decl("_HID", aml_eisaid("PNP0A08")));
+         aml_append(dev, aml_name_decl("_CID", aml_eisaid("PNP0A03")));
+diff --git a/hw/i386/pc_q35.c b/hw/i386/pc_q35.c
+index fd96d0345c..c2bb025991 100644
+--- a/hw/i386/pc_q35.c
++++ b/hw/i386/pc_q35.c
+@@ -45,6 +45,10 @@
+ #include "hw/i386/pc.h"
+ #include "hw/i386/amd_iommu.h"
+ #include "hw/i386/intel_iommu.h"
++#include "hw/odp/i2c-controller.h"
++#include "hw/odp/pl061.h"
++#include "hw/or-irq.h"
++#include "chardev/char.h"
+ #include "hw/virtio/virtio-iommu.h"
+ #include "hw/display/ramfb.h"
+ #include "hw/ide/pci.h"
+@@ -124,6 +128,52 @@ static int ehci_create_ich9_with_companions(PCIBus *bus, int slot)
+     return 0;
+ }
+ 
++static qemu_irq pc_q35_odp_irq(X86MachineState *x86ms,
++                              DeviceState *lpc_dev, int irq)
++{
++    DeviceState *irq_or = qdev_new(TYPE_OR_IRQ);
++
++    qdev_prop_set_uint16(irq_or, "num-lines", 2);
++    qdev_realize_and_unref(irq_or, NULL, &error_fatal);
++    qdev_connect_gpio_out(irq_or, 0, x86ms->gsi[irq]);
++    qdev_connect_gpio_out_named(lpc_dev, ICH9_GPIO_GSI, irq,
++                                qdev_get_gpio_in(irq_or, 0));
++    return qdev_get_gpio_in(irq_or, 1);
++}
++
++static void pc_q35_init_odp_devices(X86MachineState *x86ms, DeviceState *lpc_dev)
++{
++    DeviceState *dev = qdev_new(TYPE_ODP_I2C_CONTROLLER);
++    SysBusDevice *sysbus = SYS_BUS_DEVICE(dev);
++    Chardev *chr = qemu_chr_find("ec-i2c-controller");
++    int pin;
++
++    if (chr) {
++        qdev_prop_set_chr(dev, "chardev", chr);
++    }
++    sysbus_realize_and_unref(sysbus, &error_fatal);
++    sysbus_mmio_map(sysbus, 0, Q35_ODP_I2C_BASE);
++    sysbus_connect_irq(sysbus, 0,
++                      pc_q35_odp_irq(x86ms, lpc_dev, Q35_ODP_I2C_IRQ));
++
++    dev = qdev_new(TYPE_ODP_PL061);
++    sysbus = SYS_BUS_DEVICE(dev);
++    qdev_prop_set_uint8(dev, "pullups", 0x01);
++    qdev_prop_set_uint8(dev, "pulldowns", 0xfe);
++    for (pin = 0; pin < 8; pin++) {
++        g_autofree char *propname = g_strdup_printf("gpio%d", pin);
++
++        chr = qemu_chr_find(propname);
++        if (chr) {
++            qdev_prop_set_chr(dev, propname, chr);
++        }
++    }
++    sysbus_realize_and_unref(sysbus, &error_fatal);
++    sysbus_mmio_map(sysbus, 0, Q35_ODP_GPIO_BASE);
++    sysbus_connect_irq(sysbus, 0,
++                      pc_q35_odp_irq(x86ms, lpc_dev, Q35_ODP_GPIO_IRQ));
++}
++
+ /* PC hardware initialisation */
+ static void pc_q35_init(MachineState *machine)
+ {
+@@ -272,6 +322,7 @@ static void pc_q35_init(MachineState *machine)
+     }
+ 
+     ioapic_init_gsi(gsi_state, OBJECT(phb));
++    pc_q35_init_odp_devices(x86ms, lpc_dev);
+ 
+     if (tcg_enabled()) {
+         x86_register_ferr_irq(x86ms->gsi[13]);
+diff --git a/include/hw/pci-host/q35.h b/include/hw/pci-host/q35.h
+index ddafc3f2e3..a4fe280a37 100644
+--- a/include/hw/pci-host/q35.h
++++ b/include/hw/pci-host/q35.h
+@@ -35,6 +35,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(Q35PCIHost, Q35_HOST_DEVICE)
+ #define TYPE_MCH_PCI_DEVICE "mch"
+ OBJECT_DECLARE_SIMPLE_TYPE(MCHPCIState, MCH_PCI_DEVICE)
+ 
++#define Q35_ODP_I2C_BASE  0xfed80000
++#define Q35_ODP_GPIO_BASE 0xfed81000
++#define Q35_ODP_MMIO_SIZE 0x1000
++#define Q35_ODP_I2C_IRQ   10
++#define Q35_ODP_GPIO_IRQ  11
++
+ struct MCHPCIState {
+     /*< private >*/
+     PCIDevice parent_obj;
